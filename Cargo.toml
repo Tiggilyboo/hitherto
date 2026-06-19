@@ -1,7 +1,0 @@
-[package]
-name = "hitherto"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-ash = { version = "0.38.0", features = ["linked", "debug"] }
