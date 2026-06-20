@@ -1,14 +1,19 @@
 .intel_syntax noprefix
 
 .extern vkCreateInstance
-.extern vkEnumeratePhysicalDevices
 .extern vkDestroyInstance
+.extern vkEnumeratePhysicalDevices
+.extern vkGetPhysicalDeviceProperties
+.extern vkGetPhysicalDeviceQueueFamilyProperties
 
 .section .rodata
 
 app_name:
   .asciz "hitherto"
-
+newline:
+  .asciz "\n"
+msg_devices:
+  .asciz "Selected device(s): \n"
 msg_bootstrapped:
   .asciz "Strapped some boots\n"
 
@@ -70,24 +75,26 @@ device_count:
 .align 8
 devices:
   .zero 8
-  
 .align 8
 devices_bytes:
   .zero 8
+.align 8
+device_properties:
+  .zero 552
+.align 8
+selected_device:
+  .zero 8
+.align 4
+selected_device_type:
+  .zero 4
     
 .section .text
 
 # void = vkDestroyInstance(VkInstance rdi, VkAllocationCallbacks* rsi)
-destroy_instance:
-  # ensure call stack pointer is aligned
-  push rbp
-  mov rbp, rsp
-  
+destroy_instance:  
   mov rdi, qword ptr [rip + instance]
   xor esi, esi
   call vkDestroyInstance
-
-  pop rbp
   ret
 
 # rax = munmap(void* addr rdi, size_t length rsi)
@@ -98,6 +105,7 @@ unmap_devices:
   ret
 
 cleanup:
+  push rdi
   test dword ptr [rip + alloc_state], STATE_DEVICES
   jz skip_devices
   call unmap_devices
@@ -107,12 +115,14 @@ skip_devices:
   call destroy_instance
   and dword ptr [rip + alloc_state], ~STATE_VKINSTANCE
 skip_instance:
-  jmp exit
+  pop rdi
+  call exit
 
 # fail(rdi = error string)
 .type fail, @function
 fail:
   call print_err
+  mov edi, 1 # exit code = 1
   jmp cleanup
 
 .global _start
@@ -155,7 +165,9 @@ check_device_count:
   mov eax, dword ptr [rip + device_count]
   test eax, eax
   jne compute_allocation_size
+no_devices:
   lea rdi, [rip + err_no_devices]
+  call fail
 
 compute_allocation_size:
   # devices_bytes = device_count * sizeof(VkPhysicalDevice)
@@ -163,6 +175,7 @@ compute_allocation_size:
   shl rax, 3 # rax = count * 8
   mov qword ptr [rip + devices_bytes], rax
 
+mmap_devices:
   # rax = mmap(void* addr rdi, size_t length rsi, int prot rdx, int flags r10, int fd r8, off_t offset r9)
   xor edi, edi # addr = NULL
   mov rsi, qword ptr [rip + devices_bytes]
@@ -176,10 +189,88 @@ compute_allocation_size:
   mov qword ptr [rip + devices], rax
   or dword ptr [rip + alloc_state], STATE_DEVICES
 
+populate_devices:
+  # VkResult = vkEnumeratePhysicalDevices(VkInstance rdi, uint32_t* pCount rsi, VkPhysicalDevice* pDevices rdx)
+  mov rdi, qword ptr [rip + instance]
+  lea rsi, [rip + device_count]
+  mov rdx, qword ptr [rip + devices]
+  call vkEnumeratePhysicalDevices
+  test eax, eax
+  je devices_ok
+  lea rdi, [rip + err_vk_enum]
+  call fail
+devices_ok:
+
+print_devices:
+  # reset selected_device_type as .bss is only 0 init
+  mov dword ptr [rip + selected_device_type], -1
+
+
+  xor rcx, rcx
+  mov eax, dword ptr [rip + device_count]
+device_loop:
+  # we have to reload this every iteration as call below clobbers eax
+  mov eax, dword ptr [rip + device_count]
+  cmp rcx, rax
+  jge devices_printed
+
+  # VkResult = vkGetPhysicalDeviceProperties(vkPhysicalDevice rdi, VkPhysicalDeviceProperties* rsi)
+  mov r8, qword ptr [rip + devices]
+  mov rdx, rcx
+  shl rdx, 3  # offset = i * 8
+  add r8, rdx # r8 += offset
+  mov rdi, qword ptr [r8] # devices[r8]
+  lea rsi, [rip + device_properties]
+  call vkGetPhysicalDeviceProperties
+
+  # validate / check that device is better than last
+  # device type is at offset = 16 of VkPhysicalDeviceProperties
+  mov eax, dword ptr [rip + device_properties + 16]
+
+  # test no devices found?
+  #jmp skip_device
+
+  cmp eax, 2 # DISCRETE_GPU
+  je select_device
+  cmp eax, 4 # CPU 
+  je skip_device
+  cmp eax, 0 # OTHER
+  je skip_device
+  cmp eax, dword ptr [rip + selected_device_type]
+  jge skip_device
+  
+select_device:
+  mov qword ptr [rip + selected_device], rdi
+  mov dword ptr [rip + selected_device_type], eax
+  lea rdi, [rip + msg_devices]
+  call print
+  # device name is at offset = 20 of VkPhysicalDeviceProperties
+  lea rdi, [rip + device_properties + 20]
+  call print
+
+  # newline separated
+  push rax
+  lea rdi, [rip + newline]
+  call print
+  pop rax
+  jmp devices_printed
+
+skip_device:
+  inc rcx
+  jmp device_loop
+
+devices_printed:
+  cmp dword ptr [rip + selected_device_type], -1
+  push rbp
+  mov rbp, rsp  
+  je no_devices
+  pop rbp
+
 started:
   lea rdi, [rip + msg_bootstrapped]
   call print
 
 finished:
-  mov edi, 0
+  # exit code 0
+  xor edi, edi
   jmp cleanup

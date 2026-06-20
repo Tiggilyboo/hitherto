@@ -19,9 +19,7 @@ Do **not** try to generate new Vulkan pipelines on GPU.
 
 Accept these rules up front:
 
-1. GPU cannot call Vulkan.
-2. GPU cannot create buffers.
-3. GPU cannot create pipelines.
+1. GPU cannot call Vulkan (directly).
 4. GPU can only read/write buffers the host already bound.
 5. GPU “compiled code” must be data consumed by an existing executor kernel.
 6. Real SPIR-V pipeline generation must be host-assisted later.
