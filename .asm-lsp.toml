@@ -1,0 +1,14 @@
+[default_config]
+version = "0.10.0"
+assembler = "gas"
+instruction_set = "x86-64"
+
+[default_config.opts]
+compiler = "clang"
+compile_flags = [
+  "-g",
+  "-Isrc",
+  "-c",
+  "-x",
+  "assembler",
+]

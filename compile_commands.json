@@ -1,0 +1,30 @@
+[
+  {
+    "file": "src/bootstrap.s",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Isrc",
+      "-c",
+      "-o",
+      "obj/bootstrap.o",
+      "src/bootstrap.s"
+    ],
+    "directory": "/mnt/source/hitherto",
+    "output": "obj/bootstrap.o"
+  },
+  {
+    "file": "src/vulkan.s",
+    "arguments": [
+      "/usr/bin/clang",
+      "-g",
+      "-Isrc",
+      "-c",
+      "-o",
+      "obj/vulkan.o",
+      "src/vulkan.s"
+    ],
+    "directory": "/mnt/source/hitherto",
+    "output": "obj/vulkan.o"
+  }
+]
