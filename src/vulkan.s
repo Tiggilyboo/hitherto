@@ -8,6 +8,14 @@
 
 .extern vkCreateInstance
 .extern vkDestroyInstance
+
+.extern vkCreateDevice
+.extern vkGetDeviceQueue
+.extern vkDestroyDevice
+
+.extern vkCreateBuffer
+.extern vkDestroyBuffer
+
 .extern vkEnumeratePhysicalDevices
 .extern vkGetPhysicalDeviceProperties
 .extern vkGetPhysicalDeviceQueueFamilyProperties
@@ -129,26 +137,33 @@ instance_create_info:
   .long 0                      # padding before ppEnabledExtensionNames
   .quad 0                      # ppEnabledExtensionNames = NULL
 
-# 40 bytes
+
+# VkDeviceQueueCreateInfo (40 bytes)
+queue_priority:
+  .float 1.0
 device_queue_create_info:
   .long 2  # sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
   .long 0  # padding before pNext
   .quad 0  # pNext = NULL
   .long 0  # flags = 0
   .long 0  # queueFamilyIndex
+  .long 0  # padding before queueCount
   .long 1  # queueCount = 1
-  .quad 0  # queuePriority
+  .quad queue_priority  # queuePriority
 
-# 72 bytes
+# VkDeviceCreateInfo (72 bytes)
 device_create_info:
   .long 3  # sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
   .long 0  # padding before pNext
-  .quad 0  # flags = 0
+  .quad 0  # pNext = 0
+  .long 0  # flags = 0
   .long 1  # queueCreateInfoCount
   .quad device_queue_create_info
-  .quad 0  # enabledLayerCount
+  .long 0  # enabledLayerCount
+  .long 0  # pad
   .quad 0  # ppEnabledLayerNames
-  .quad 0  # enabledExtensionCount
+  .long 0  # enabledExtensionCount
+  .long 0  # pad
   .quad 0  # ppEnabledExtensionNames
   .quad 0  # pEnabledFeatures
 
@@ -162,7 +177,9 @@ fn destroy_instance
   ret
 
 fn destroy_device
-  # TODO
+  load qword, rdi, logical_device
+  xor esi, esi
+  calla vkDestroyDevice
   ret
 
 # rax = munmap(void* addr rdi, size_t length rsi)
@@ -462,6 +479,25 @@ fn fail
   jmp fail
   
 .create_device:
+  mov eax, [rip + queue_family_index]
+  mov dword ptr [rip + device_queue_create_info + 20], eax
+
+  # vkResult = vkCreateDevice(physicalDevice, device_create_info, NULL, logical_devices)
+  mov rdi, [rip + selected_device]
+  lea rsi, [rip + device_create_info]
+  xor edx, edx
+  lea rcx, [rip + logical_device]
+  calla vkCreateDevice
+  test eax, eax
+  jne fail
+  or dword ptr [rip + alloc_state], STATE_VKDEVICE
+
+  # vkResult = vkGetDeviceQueue(device, queueFamilyIndex, 0, queue)
+  mov rdi, [rip + logical_device]
+  mov esi, [rip + queue_family_index]
+  xor edx, edx
+  lea rcx, [rip + queue]
+  calla vkGetDeviceQueue
 
 .started:
   lea rdi, [rip + msg_bootstrapped]

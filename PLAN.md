@@ -8,6 +8,9 @@ Current state:
 - Host links against `libvulkan`.
 - Host can print to stdout/stderr and use `mmap`.
 - Host creates a Vulkan instance, enumerates physical devices, reads physical-device properties, and selects a preferred compute device.
+- Logical device created with one compute queue; `VkQueue` fetched via `vkGetDeviceQueue`.
+- Cleanup runs in reverse creation order: `vkDestroyDevice`, unmap queue props, unmap devices, `vkDestroyInstance`.
+- Signal handler exits directly without Vulkan cleanup.
 - The host binary should stay tiny. Treat the current ~18K size as a design constraint, not an accident.
 
 Target architecture:
@@ -62,16 +65,13 @@ Already done:
 - `vkEnumeratePhysicalDevices`
 - `vkGetPhysicalDeviceProperties`
 - preferred physical-device selection
-
-Next:
-
-1. Query queue-family count.
-2. Allocate queue-family-property array with `mmap`.
-3. Query queue-family properties.
-4. Select compute-capable queue family.
-5. Create logical device with one queue.
-6. Fetch `VkQueue`.
-7. Add `vkDestroyDevice` to cleanup.
+- Query queue-family count.
+- Allocate queue-family-property array with `mmap`.
+- Query queue-family properties.
+- Select compute-capable queue family.
+- Create logical device with one queue.
+- Fetch `VkQueue`.
+- Add `vkDestroyDevice` to cleanup.
 
 Minimal queue policy:
 
@@ -940,12 +940,12 @@ Use `vulkan_core.h` from the Vulkan SDK as the final authority for constants and
 
 ### Milestone A — Device and queue
 
-- [ ] Query queue-family count.
-- [ ] Allocate queue-family properties.
-- [ ] Select compute-capable queue family.
-- [ ] Create logical device.
-- [ ] Fetch queue.
-- [ ] Destroy logical device in cleanup.
+- [x] Query queue-family count.
+- [x] Allocate queue-family properties.
+- [x] Select compute-capable queue family.
+- [x] Create logical device.
+- [x] Fetch queue.
+- [x] Destroy logical device in cleanup.
 
 ### Milestone B — Runtime buffer
 
