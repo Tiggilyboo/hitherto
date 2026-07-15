@@ -2,7 +2,7 @@
 
 CC = clang
 ASFLAGS = -g -Isrc
-LDFLAGS = -nostdlib -Wl,-e,_start -lvulkan
+LDFLAGS = -g -no-pie -nostdlib -Wl,-e,_start -lvulkan
 SRCS := $(wildcard src/*.s)
 INCS := $(wildcard src/*.inc)
 OBJS := $(patsubst src/%.s,obj/%.o,$(SRCS))
@@ -13,7 +13,7 @@ all: $(BIN)
 
 $(BIN): $(OBJS)
 	rm -f $@
-	$(CC) -g -o $@ $^ $(LDFLAGS)
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 obj/%.o: src/%.s $(INCS) | obj
 	$(CC) $(ASFLAGS) -c -o $@ $<
