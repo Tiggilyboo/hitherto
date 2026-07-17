@@ -9,13 +9,7 @@
 .equ STATE_RUNTIME_MEMORY, 32
 .equ STATE_RUNTIME_MAPPED, 64
 
-# void vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties* pProperties)
-# ABI: rdi=physicalDevice, rsi=pProperties | returns void
-.extern vkGetPhysicalDeviceProperties
 
-# void vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties* pQueueFamilyProperties)
-# ABI: rdi=physicalDevice, rsi=pQueueFamilyPropertyCount, rdx=pQueueFamilyProperties | returns void
-.extern vkGetPhysicalDeviceQueueFamilyProperties
 
 .section .rodata
 
@@ -58,6 +52,8 @@ err_create_buffer:
   .asciz "vkCreateBuffer failed\n"
 err_buffer_memory_requirements:
   .asciz "vkGetBufferMemoryRequirements returned 0 size or no supported memory types\n"
+err_no_memory_type_found:
+  .asciz "No valid buffer memory type found with HOST_VISIBLE | HOST_CORHERENT flags\n"
 
 .section .bss
 
@@ -74,7 +70,7 @@ device_count:
 
 # VkPhysicalDevice* allocated with mmap
 .align 8
-devices:
+physical_device:
   .zero 8
 .align 8
 devices_bytes:
@@ -127,10 +123,11 @@ runtime_memory_requirements:
   .zero 8 # alignment
   .zero 4 # memoryTypeBits
 runtime_memory_properties:
-  .zero 128 # memoryTypes[16] : propertyFlags + heapIndex = 8 bytes
+  .zero 4   # memoryTypeCount
+  .zero 256 # memoryTypes[32] : propertyFlags + heapIndex = 8 bytes
   .zero 4   # heapCount
   .zero 4   # pad
-  .zero 384 # memoryHeaps[16] : flags + size(8) + size(8) = 24 bytes
+  .zero 256 # memoryHeaps[16] : flags + size(8) + size(8) = 24 bytes
 
 .section .data
 app_info:
@@ -249,19 +246,9 @@ fn create_buffer
   calla vkCreateBuffer
   ret
 
-fn get_buffer_memory_requirements
-  # void vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkMemoryRequirements* pMemoryRequirements)
-  # ABI: rdi=device, rsi=buffer, rdx=pMemoryRequirements | returns void
-  .extern vkGetBufferMemoryRequirements
-  load qword, rdi, logical_device
-  load qword, rsi, runtime_buffer
-  addr rdx, runtime_memory_requirements
-  calla vkGetBufferMemoryRequirements
-  ret
-
 # rax = munmap(void* addr rdi, size_t length rsi)
-fn unmap_devices
-  load qword, rdi, devices
+fn unmap_pysical_device
+  load qword, rdi, physical_device
   load qword, rsi, devices_bytes
   calla munmap
   ret
@@ -297,7 +284,7 @@ fn cleanup
 
   test dword ptr [rip + alloc_state], STATE_DEVICE_MAP
   jz .skip_devices
-  calla unmap_devices
+  calla unmap_pysical_device
 .skip_devices:
 
   test dword ptr [rip + alloc_state], STATE_VKINSTANCE
@@ -366,7 +353,7 @@ fn fail
   shl rax, 3 # rax = count * 8
   store qword, devices_bytes, rax
 
-.mmap_devices:
+.mmap_physical_device:
   # rax = mmap(void* addr rdi, size_t length rsi, int prot rdx, int flags r10, int fd r8, off_t offset r9)
   xor edi, edi # addr = NULL
   load qword, rsi, devices_bytes
@@ -377,14 +364,14 @@ fn fail
   calla mmap
   cmp rax, -4095
   jae cleanup
-  store qword, devices, rax
+  store qword, physical_device, rax
   or dword ptr [rip + alloc_state], STATE_DEVICE_MAP
 
 .populate_devices:
   # VkResult = vkEnumeratePhysicalDevices(VkInstance rdi, uint32_t* pCount rsi, VkPhysicalDevice* pDevices rdx)
   load qword, rdi, instance
   addr rsi, device_count
-  load qword, rdx, devices
+  load qword, rdx, physical_device
   calla vkEnumeratePhysicalDevices
   test eax, eax
   je .devices_ok
@@ -405,8 +392,10 @@ fn fail
   cmp rcx, rax
   jge .devices_printed
 
-  # VkResult = vkGetPhysicalDeviceProperties(vkPhysicalDevice rdi, VkPhysicalDeviceProperties* rsi)
-  load qword, r8, devices
+  # void vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties* pProperties)
+  # ABI: rdi=physicalDevice, rsi=pProperties | returns void
+  .extern vkGetPhysicalDeviceProperties
+  load qword, r8, physical_device
   mov rdx, rcx
   shl rdx, 3  # offset = i * 8
   add r8, rdx # r8 += offset
@@ -470,7 +459,9 @@ fn fail
   pop rbp
 
 .get_queue_family_count:
-  # vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice rdi, uint32_t* pCount rsi, VkQueueFamilyProperties* pProperties rdx)
+  # void vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties* pQueueFamilyProperties)
+  # ABI: rdi=physicalDevice, rsi=pQueueFamilyPropertyCount, rdx=pQueueFamilyProperties | returns void
+  .extern vkGetPhysicalDeviceQueueFamilyProperties
   xor edi, edi # addr = NULL
   load qword, rdi, selected_device
   addr rsi, queue_family_count
@@ -607,7 +598,13 @@ fn fail
   or dword ptr [rip + alloc_state], STATE_RUNTIME_BUFFER
   
 .get_runtime_requirements:
-  calla get_buffer_memory_requirements
+  # void vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkMemoryRequirements* pMemoryRequirements)
+  # ABI: rdi=device, rsi=buffer, rdx=pMemoryRequirements | returns void
+  .extern vkGetBufferMemoryRequirements
+  load qword, rdi, logical_device
+  load qword, rsi, runtime_buffer
+  addr rdx, runtime_memory_requirements
+  calla vkGetBufferMemoryRequirements
   load qword, rax, runtime_memory_requirements
   test rax, rax 
   addr rdi, err_buffer_memory_requirements
@@ -619,6 +616,55 @@ fn fail
   addr rdi, err_buffer_memory_requirements
   jz fail
 
+.get_device_memory_properties:  
+  # void vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties* pMemoryProperties)
+  # ABI: rdi=physicalDevice, rsi=pMemoryProperties | returns void
+  .extern vkGetPhysicalDeviceMemoryProperties  
+  load qword, rdi, selected_device
+  addr rsi, runtime_memory_properties
+  calla vkGetPhysicalDeviceMemoryProperties
+
+.find_memory_type:
+  # required = HOST_VISIBLE 0x2 | HOST_COHERENT 0x4 = 0x6
+  mov r9d, 6
+  load dword, r8d, runtime_memory_properties # memoryTypeCount
+  load dword, r10d, runtime_memory_requirements + 16 # memoryTypeBits
+
+  xor ecx, ecx
+.find_memtype_loop:
+  cmp ecx, r8d
+  jge .no_valid_memory_type
+
+  mov eax, r10d
+  shr eax, cl
+  test eax, 1
+  jz .find_memtype_next
+
+  # propertyFlags @ 4 + i * 8
+  mov edx, ecx
+  imul edx, 8
+  add edx, 4 # memoryTypes offset
+  load dword, eax, runtime_memory_properties + edx
+
+  and eax, r9d
+  cmp eax, r9d
+  je .found_memory_type
+
+.find_memtype_next:
+  inc ecx
+  jmp .find_memtype_loop
+
+.found_memory_type:
+  store dword, runtime_memory_type_index, ecx
+  jmp .allocate_runtime_memory
+
+.no_valid_memory_type:
+  addr rdi, err_no_memory_type_found
+  jmp fail
+
+.allocate_runtime_memory:
+  # TODO
+  
 .started:
   addr rdi, msg_bootstrapped
   calla print
