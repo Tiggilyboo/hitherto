@@ -79,7 +79,7 @@ devices_bytes:
 
 # VkPhysicalDeviceProperties*
 device_properties:
-  .zero 552 # max 8
+  .zero 824
 .align 8
 selected_device:
   .zero 8
@@ -122,11 +122,11 @@ runtime_memory_requirements:
   .zero 8 # size
   .zero 8 # alignment
   .zero 4 # memoryTypeBits
+  .zero 4 # pad
 runtime_memory_properties:
   .zero 4   # memoryTypeCount
   .zero 256 # memoryTypes[32] : propertyFlags + heapIndex = 8 bytes
   .zero 4   # heapCount
-  .zero 4   # pad
   .zero 256 # memoryHeaps[16] : flags + size(8) + size(8) = 24 bytes
 
 .section .data
@@ -165,6 +165,7 @@ device_queue_create_info:
   .long 0  # flags = 0
   .long 0  # queueFamilyIndex
   .long 1  # queueCount = 1
+  .long 0  # pad
   .quad queue_priority  # queuePriority
 
 # VkDeviceCreateInfo (72 bytes)
@@ -189,7 +190,8 @@ buffer_create_info:
   .long 12  # sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
   .long 0   # pad
   .quad 0   # pNext*
-  .quad 0   # flags
+  .long 0   # flags
+  .long 0   # pad
   .quad 1048576   # size = 1MB
   .long 0x23 # usage = STORAGE(0x20) | TRANSFER_SRC(0x01) | TRANSFER_DST (0x02)
   .long 0 # sharingMode = VK_SHARING_EXCLUSIVE
@@ -204,6 +206,7 @@ memory_allocate_info:
   .quad 0 # pNext
   .quad 0 # allocationSize
   .long 0 # memoryTypeIndex
+  .long 0 # pad
 
 .section .text
 
