@@ -6,7 +6,6 @@ LDFLAGS = -g -no-pie -nostdlib -Wl,-e,_start -lvulkan
 SRCS := $(wildcard src/*.s)
 INCS := $(wildcard src/*.inc)
 OBJS := $(patsubst src/%.s,obj/%.o,$(SRCS))
-EXPANDED := $(patsubst src/%.s,obj/%.expanded.s,$(SRCS))
 BIN := hitherto
 
 all: $(BIN)
@@ -24,9 +23,7 @@ obj:
 clean:
 	rm -rf obj $(BIN)
 
-expanded: $(EXPANDED)
-
-obj/%.expanded.s: src/%.s $(INCS) | obj
+obj/%.s: src/%.s $(INCS) | obj
 	llvm-mc -triple=x86_64-linux-gnu -x86-asm-syntax=intel -I src $< -o $@
 
 .PHONY: all clean
