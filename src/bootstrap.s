@@ -7,6 +7,7 @@
 .equ E_DIC, -3
 .equ E_SYN, -4
 .equ E_DIV, -5
+.equ E_STA, -6
 
 .section .rodata
 
@@ -22,6 +23,10 @@ err_token_invalid:
     .asciz "Token invalid\n"
 err_div_zero:
     .asciz "Divide by zero\n"
+err_stack_underflow:
+    .asciz "Stack underflow\n"
+err_stack_overflow:
+    .asciz "Stack overflow\n"
 ok_test:
     .asciz "OK\n"
 
@@ -65,7 +70,6 @@ dictionary:
     .quad word_write
     .string "'"
     .quad word_tick
-    .string "~"
     .byte 0 # End of dictionary marker
 
 
@@ -192,6 +196,10 @@ parse_int:
 read_token:
     xor rcx, rcx
 .skip_ws:
+    call read_char
+    cmp eax, E_EOF
+    je .fail_token_eof
+
     cmp al, ' ' 
     je .skip_ws
     cmp al, '\t'
@@ -199,6 +207,12 @@ read_token:
     cmp al, '\n'
     je .skip_ws
 .next:
+    cmp rcx, TOKEN_MAX_LEN
+    jge .fail_token_overflow
+
+    mov byte ptr [rip + token_buf + rcx], al
+    inc rcx
+
     call read_char
     cmp eax, E_EOF
     je .done
@@ -210,51 +224,36 @@ read_token:
     cmp al, '\n'
     je .done
 
-    cmp rcx, TOKEN_MAX_LEN
-    jge .fail_token_overflow
-
-    mov byte ptr [rip + token_buf + rcx], al
-    inc rcx
     jmp .next
-
 .done:
     # null-terminate
     mov byte ptr [rip + token_buf + rcx], 0
     xor eax, eax
     ret
-
-.fail_token_eof:
-    mov rax, E_EOF
-    lea rsi, [rip + err_token]
-    jmp fail
-.fail_token_overflow:
-    mov rax, E_LEN
-    lea rsi, [rip + err_token_len]
-    jmp fail
+# WORDS
 
 word_dup:
-    sub r15, 8
-    mov rax, [r15]
-    add r15, 8
-    mov [r15], rax
+    mov [r15], r13
     add r15, 8
     ret
 
 word_drop:
+    lea rax, [rip + data_stack]
+    cmp r15, rax
+    je .fail_stack_underflow
     sub r15, 8
+    mov r13, [r15]
     ret
 
 word_swap:
-    mov rax, [r15 - 8]
-    mov rdx, [r15 - 16]
-    mov [r15 - 16], rax
-    mov [r15 - 8], rdx
+    xchg r13, [r15 - 8]
     ret
 
 word_over:
-    mov rax, [r15 - 16]
-    mov [r15], rax
+    mov rax, [r15 - 8]
+    mov [r15], r13
     add r15, 8
+    mov r13, rax
     ret
 
 word_def:
@@ -263,35 +262,23 @@ word_end:
 
 word_add:
     sub r15, 8
-    mov rax, [r15]
-    sub r15, 8
-    add rax, [r15]
-    mov [r15], rax
-    add r15, 8
+    add r13, [r15]
     ret
 
 word_sub:
     sub r15, 8
     mov rax, [r15]
-    sub r15, 8
-    mov rdx, [r15]
-    sub rax, rdx
-    mov [r15], rax
-    add r15, 8
+    sub rax, r13
+    mov r13, rax
     ret
 
 word_mul:
     sub r15, 8
-    mov rax, [r15]
-    sub r15, 8
-    imul rax, [r15]
-    mov [r15], rax
-    add r15, 8
+    imul r13, [r15]
     ret
 
 word_write:
-    sub r15, 8
-    mov rax, [r15]
+    mov rax, r13
     lea rsi, [rip + write_buf + 32]
     dec rsi
     mov byte ptr [rsi], '\n'
@@ -325,19 +312,19 @@ word_write:
     lea rdx, [rip + write_buf + 32]
     sub rdx, rsi
     call write
+    sub r15, 8
+    mov r13, [r15]
     ret
     
 word_div:
-    sub r15, 8
-    mov rcx, [r15]
-    sub r15, 8
-    mov rax, [r15]
-    cqo
+    mov rcx, r13 # divisor = rhs TOS
     test rcx, rcx
     jz .fail_div_zero
+    sub r15, 8
+    mov rax, [r15] # dividend = lhs
+    cqo
     idiv rcx # rax = div, rdx = remainder
-    mov [r15], rax
-    add r15, 8
+    mov r13, rax
     ret
 
 word_tick:
@@ -346,8 +333,9 @@ word_tick:
     call find_word
     jc .fail_notfound
 
-    mov [r15], rax
+    mov [r15], r13 # old TOS = NOS
     add r15, 8
+    mov r13, rax # XT becomes new TOS
     ret
 
 find_word:
@@ -386,7 +374,6 @@ find_word:
     stc
     ret
     
-
 .global _start
 _start:
     lea r14, [rip + user_dict]
@@ -407,8 +394,9 @@ _start:
     jc .fail_notfound
 
 .push_numeric:
-    mov [r15], rax
+    mov [r15], r13
     add r15, 8
+    mov r13, rax
     jmp .repl_loop
     
 .repl_done:
@@ -428,3 +416,22 @@ _start:
     mov rax, E_DIV
     lea rsi, [rip + err_div_zero]
     jmp fail
+
+.fail_stack_underflow:
+    mov ax, E_STA
+    lea rsi, [rip + err_stack_underflow]
+    jmp fail
+.fail_stack_overflow:
+    mov ax, E_STA
+    lea rsi, [rip + err_stack_overflow]
+    jmp fail
+
+.fail_token_eof:
+    mov rax, E_EOF
+    lea rsi, [rip + err_token]
+    jmp fail
+.fail_token_overflow:
+    mov rax, E_LEN
+    lea rsi, [rip + err_token_len]
+    jmp fail
+
