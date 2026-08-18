@@ -47,6 +47,8 @@ token_write:
 token_tick:
     .asciz "'"
     .skip 29
+token_lit:
+    .zero 32
 
 err_unknown:
     .asciz "Unknown error occurred\n"
@@ -81,6 +83,8 @@ io_char:
     .skip 1
 write_buf:
     .skip 32
+lit:
+    .skip 8
 
 .align 16
 dict:
@@ -354,8 +358,29 @@ word_def:
 
     lea rsi, [rip + token_buf]
     call find_word
+    jnc .def_compile
+
+    # not word, try literal
+    lea rsi, [rip + token_buf]
+    call parse_int
     jc .fail_notfound
 
+    # rax = lit value
+    mov rdx, rax
+
+    lea rax, [r12 + 24]
+    lea rcx, [rip + dict_end]
+    cmp rax, rcx
+    ja .fail_dict_overflow
+
+    mov rax, [rip + lit]
+    mov [r12], rax
+    mov [r12 + 8], rdx
+    add r12, 16
+    add rbx, 2
+    jmp .def_next
+
+.def_compile:
     lea rdx, [r12 + 16]
     lea rcx, [rip + dict_end]
     cmp rdx, rcx
@@ -473,6 +498,18 @@ word_tick:
     mov r13, rax # XT becomes new TOS
     ret
 
+word_lit:
+    # next cell is data not ptr
+    mov rax, [r12]
+    add r12, 8
+    dec rbx
+
+    # push lit to dat stack
+    mov [r15], r13
+    add r15, 8
+    mov r13, rax
+    ret
+
 # rsi = pointer to null-terminated token
 # r14 = dict tail (most recent node starte, null when empty)
 # returns:
@@ -550,6 +587,11 @@ _start:
     lea rsi, [rip + token_tick]
     lea rdi, [rip + word_tick]
     call dict_add_builtin
+    lea rsi, [rip + token_lit]
+    lea rdi, [rip + word_lit]
+    call dict_add_builtin
+    mov [rip + lit], rax
+
 
 # VM reserved registers:
 # r12 = instruction pointer
