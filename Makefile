@@ -2,7 +2,7 @@
 
 CC = clang
 ASFLAGS = -g -Isrc
-LDFLAGS = -g -no-pie -nostdlib -Wl,-e,_start -lvulkan
+LDFLAGS = -g -no-pie -nostdlib -Wl,-e,_start
 SRCS := $(wildcard src/*.s)
 INCS := $(wildcard src/*.inc)
 OBJS := $(patsubst src/%.s,obj/%.o,$(SRCS))
