@@ -26,9 +26,6 @@ token_over:
 token_def:
     .asciz ":"
     .skip 29
-token_end:
-    .asciz ";"
-    .skip 29
 token_add:
     .asciz "+"
     .skip 29
@@ -46,6 +43,21 @@ token_write:
     .skip 29
 token_tick:
     .asciz "'"
+    .skip 29
+token_sys:
+    .asciz "sys"
+    .skip 27
+token_store:
+    .asciz "!"
+    .skip 29
+token_load:
+    .asciz "@"
+    .skip 29
+token_ign:
+    .asciz "#"
+    .skip 29
+token_branch:
+    .asciz "?"
     .skip 29
 token_lit:
     .zero 32
@@ -68,12 +80,16 @@ err_stack_overflow:
     .asciz "Data stack overflow\n"
 err_dict_overflow:
     .asciz "Dictionary full\n"
-ok_test:
-    .asciz "OK\n"
+
+bootstrap:
+    .incbin "src/bootstrap.ht"
+bootstrap_end:
 
 .section .bss
 
 .align 8
+reg_data:
+    .skip 64
 data_stack:
     .skip 65536
 data_stack_end:
@@ -85,6 +101,10 @@ write_buf:
     .skip 32
 lit:
     .skip 8
+input_ptr:
+    .quad 0
+input_end:
+    .quad 0
 
 .align 16
 dict:
@@ -95,16 +115,33 @@ dict_end:
 
 read_char:
     push rcx
-    mov eax, 0 # sys_read
-    xor edi, edi
+
+    # Embedded bootstrap input first.
+    mov rcx, qword ptr [rip + input_ptr]
+    cmp rcx, qword ptr [rip + input_end]
+    jae .read_char_stdin
+
+    movzx eax, byte ptr [rcx]
+    inc rcx
+    mov qword ptr [rip + input_ptr], rcx
+
+    pop rcx
+    ret
+
+.read_char_stdin:
+    mov eax, 0                    # SYS_read
+    xor edi, edi                  # stdin
     lea rsi, [rip + io_char]
     mov edx, 1
     syscall
+
     cmp rax, 1
     jne .read_char_eof
+
     movzx eax, byte ptr [rip + io_char]
     pop rcx
     ret
+
 .read_char_eof:
     mov rax, E_EOF
     pop rcx
@@ -211,6 +248,43 @@ parse_int:
     stc
     ret
 
+# RSI -> null-terminated token
+# returns:
+#   RAX = literal value
+#   CF=0 success
+#   CF=1 not a literal
+# literals:
+#   123     -> 123
+#   -123    -> -123
+#   $0      -> &reg_data[0]
+#   $N      -> $reg_data[N]
+parse_literal:
+    cmp byte ptr [rsi], '$'
+    jne .literal_number
+
+    # Register literal: $N
+    inc rsi
+    call parse_int
+    jc .literal_bad
+
+    # reg_data is currently 8 cells / 64 bytes
+    cmp rax, 7
+    ja .literal_bad
+
+    lea rcx, [rip + reg_data]
+    lea rax, [rcx + rax * 8]
+
+    clc
+    ret
+
+.literal_number:
+    call parse_int
+    ret
+
+.literal_bad:
+    stc
+    ret
+
 read_token:
     xor rcx, rcx
 .skip_ws:
@@ -224,6 +298,18 @@ read_token:
     je .skip_ws
     cmp al, '\n'
     je .skip_ws
+    cmp al, byte ptr [rip + token_ign]
+    je .skip_comment
+    jmp .next
+
+.skip_comment:
+    call read_char
+    cmp eax, E_EOF
+    je .fail_token_eof
+    cmp al, '\n'
+    jne .skip_comment
+    jmp .skip_ws
+
 .next:
     cmp rcx, TOKEN_MAX_LEN
     jge .fail_token_overflow
@@ -360,12 +446,12 @@ word_def:
     call find_word
     jnc .def_compile
 
-    # not word, try literal
+    # not a word, try literal
     lea rsi, [rip + token_buf]
-    call parse_int
+    call parse_literal
     jc .fail_notfound
 
-    # rax = lit value
+    # preserve literal while preparing LIT entry
     mov rdx, rax
 
     lea rax, [r12 + 24]
@@ -396,9 +482,6 @@ word_def:
     mov [r12], r14 # prev ptr
     mov r14, rbp
     ret
-    
-word_end:
-    jmp .fail_notfound
 
 # rax = dictionary node being executed
 word_exec:
@@ -510,6 +593,53 @@ word_lit:
     mov r13, rax
     ret
 
+word_sys:
+    # registers are all assumed externally written/read from reg_data
+    mov rax, [rip + reg_data + 0*8]
+    mov rdi, [rip + reg_data + 1*8]
+    mov rsi, [rip + reg_data + 2*8]
+    mov rdx, [rip + reg_data + 3*8]
+    mov r10, [rip + reg_data + 4*8]
+    mov r8,  [rip + reg_data + 5*8]
+    mov r9,  [rip + reg_data + 6*8]
+    syscall
+    mov [rip + reg_data + 0*8], rax
+    ret
+
+word_load:
+    mov r13, [r13]
+    ret
+
+word_store:
+    # consumes both TOS and address
+    sub r15, 8
+    mov rax, [r15]
+    mov [r13], rax
+    sub r15, 8
+    mov r13, [r15]
+    ret
+
+word_branch:
+    mov rcx, r13
+
+    # consume next cell
+    mov rax, [r12]
+    add r12, 8
+    dec rbx
+
+    # consume flag
+    sub r15, 8
+    mov r13, [r15]
+
+    test rcx, rcx
+    jz .branch_done
+    
+    mov rdx, [rax + 32]
+    call rdx
+    
+.branch_done:
+    ret
+
 # rsi = pointer to null-terminated token
 # r14 = dict tail (most recent node starte, null when empty)
 # returns:
@@ -566,9 +696,6 @@ _start:
     lea rsi, [rip + token_def]
     lea rdi, [rip + word_def]
     call dict_add_builtin
-    lea rsi, [rip + token_end]
-    lea rdi, [rip + word_end]
-    call dict_add_builtin
     lea rsi, [rip + token_add]
     lea rdi, [rip + word_add]
     call dict_add_builtin
@@ -587,11 +714,30 @@ _start:
     lea rsi, [rip + token_tick]
     lea rdi, [rip + word_tick]
     call dict_add_builtin
+    lea rsi, [rip + token_sys]
+    lea rdi, [rip + word_sys]
+    call dict_add_builtin
+    lea rsi, [rip + token_store]
+    lea rdi, [rip + word_store]
+    call dict_add_builtin
+    lea rsi, [rip + token_load]
+    lea rdi, [rip + word_load]
+    call dict_add_builtin
+    lea rsi, [rip + token_branch]
+    lea rdi, [rip + word_branch]
+    call dict_add_builtin
+
     lea rsi, [rip + token_lit]
     lea rdi, [rip + word_lit]
     call dict_add_builtin
     mov [rip + lit], rax
 
+    # load embedded bootstrap code
+    lea rax, [rip + bootstrap]
+    mov [rip + input_ptr], rax
+
+    lea rax, [rip + bootstrap_end]
+    mov [rip + input_end], rax
 
 # VM reserved registers:
 # r12 = instruction pointer
@@ -603,23 +749,23 @@ _start:
 
     lea rsi, [rip + token_buf]
     call find_word
-    jc .try_number
+    jc .try_lit
 
     mov rdx, [rax + 32]
     call rdx
-
     jmp .repl_loop
-.try_number:
+
+.try_lit:
     lea rsi, [rip + token_buf]
-    call parse_int
+    call parse_literal
     jc .fail_notfound
 
-.push_numeric:
+.push_literal:
     mov [r15], r13
     add r15, 8
     mov r13, rax
     jmp .repl_loop
-    
+
 .repl_done:
     call exit
 
