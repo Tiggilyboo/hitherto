@@ -28,11 +28,5 @@
     sys
 ;
 
-: a 323 ;
-: b 234 ;
-: c -1 ;
-: test
-    c ? a
-    c ? b
-    b ? c
-;
+# must end on newline
+
