@@ -1,9 +1,23 @@
+# Dedicated register association
+# rbp = current dict word / execution frame
+# rbx = control stack pointer
+# r12 = threaded instruction pointer
+# r13 = TOS
+# r14 = dictionary tail
+# r15 = data stack pointer
 .intel_syntax noprefix
 
 .equ STATE_EXE, 0
 .equ STATE_DEF, 1
 
 .equ TOKEN_MAX_LEN, 31
+.equ TOKEN_SIZE,    32
+
+.equ NODE_CODE, 32
+.equ NODE_END,  40
+.equ NODE_BODY, 48
+
+.equ CONTROL_MAX,   64
 
 .equ E_EOF, -1
 .equ E_LEN, -2
@@ -16,75 +30,75 @@
 
 token_dup:
     .asciz "^"
-    .skip 29
+    .skip 30
 token_drop:
     .asciz "_"
-    .skip 29
+    .skip 30
 token_swap:
     .asciz "><"
-    .skip 28
+    .skip 29
 token_over:
     .asciz "<^"
-    .skip 28
-token_def:
-    .asciz ":"
     .skip 29
-token_end:
-    .asciz ";"
-    .skip 29
+token_ctrl_open:
+    .asciz "["
+    .skip 30
+token_ctrl_close:
+    .asciz "]"
+    .skip 30
 token_add:
     .asciz "+"
-    .skip 29
+    .skip 30
 token_sub:
     .asciz "-"
-    .skip 29
+    .skip 30
 token_mul:
     .asciz "*"
-    .skip 29
+    .skip 30
 token_div:
     .asciz "/"
-    .skip 29
+    .skip 30
 token_write:
     .asciz "."
-    .skip 29
+    .skip 30
 token_tick:
     .asciz "'"
-    .skip 29
+    .skip 30
 token_sys:
     .asciz "sys"
-    .skip 27
+    .skip 28
 token_store:
     .asciz "!"
-    .skip 29
+    .skip 30
 token_load:
     .asciz "@"
-    .skip 29
+    .skip 30
 token_ign:
     .asciz "#"
-    .skip 29
+    .skip 30
 token_branch:
     .asciz "?"
-    .skip 28
-token_branch_end:
-    .asciz "?;"
-    .skip 29
+    .skip 30
 token_mask_and:
     .asciz "&"
-    .skip 29
+    .skip 30
 token_mask_or:
     .asciz "|"
-    .skip 29
+    .skip 30
 token_eq:
     .asciz "="
-    .skip 29
+    .skip 30
 token_lt:
     .asciz "<"
-    .skip 29
+    .skip 30
 token_shl:
     .asciz "<<"
     .skip 29
 token_shr:
     .asciz ">>"
+    .skip 29
+token_loop:
+    .asciz "~"
     .skip 29
 
 err_unknown:
@@ -97,6 +111,10 @@ err_dict_notfound:
     .asciz "Dictionary did not contain token\n"
 err_token_invalid:
     .asciz "Token invalid\n"
+err_token_noclose:
+    .asciz "Missing close token\n"
+err_token_noopen:
+    .asciz "Missing open token\n"
 err_div_zero:
     .asciz "Divide by zero\n"
 err_stack_underflow:
@@ -107,18 +125,20 @@ err_dict_overflow:
     .asciz "Dictionary full\n"
 err_state:
     .asciz "Already in define state\n"
-err_branch_noclose:
-    .asciz "Branch missing close token\n"
-err_branch_noopen:
-    .asciz "Branch missing open token\n"
 
 .align 8
 internal_lit:
-    .zero 32
+    .zero TOKEN_SIZE
     .quad word_lit
 internal_branch:
-    .zero 32
+    .zero TOKEN_SIZE
     .quad word_branch_runtime
+internal_ctrl_push:
+    .zero TOKEN_SIZE
+    .quad word_ctrl_push
+internal_ctrl_pop:
+    .zero TOKEN_SIZE
+    .quad word_ctrl_pop
 
 bootstrap:
     .incbin "src/bootstrap.ht"
@@ -131,20 +151,21 @@ state:
     .quad 0
 reg_data:
     .skip 64
-data_stack:
-    .skip 65536
-data_stack_end:
-token_buf:
-    .skip 32
 io_char:
     .skip 1
 write_buf:
-    .skip 32
-branch_stack:
-    .skip 512 # 64 open branches
-branch_stack_end:
-branch_sp:
-    .skip 8
+    .skip TOKEN_MAX_LEN
+token_buf:
+    .skip TOKEN_SIZE
+
+.align 8
+ctrl_stack:
+    .skip CONTROL_MAX * 8
+ctrl_stack_end:
+data_stack:
+    .skip 65536
+data_stack_end:
+
 input_ptr:
     .quad 0
 input_end:
@@ -299,7 +320,6 @@ parse_int:
 # literals:
 #   123     -> 123
 #   -123    -> -123
-#   $0      -> &reg_data[0]
 #   $N      -> $reg_data[N]
 parse_literal:
     cmp byte ptr [rsi], '$'
@@ -379,7 +399,7 @@ read_token:
     ret
     
 
-# rsi = pointer to 32-byte name
+# rsi = pointer to TOKEN_MAX_LEN-byte name
 # rdi = code function pointer
 #
 # returns:
@@ -391,7 +411,7 @@ dict_add_builtin:
     ret
 
 # r14 = dictionary tail, null if empty
-# rsi = pointer to 32-byte name
+# rsi = pointer to TOKEN_MAX_LEN-byte name
 # rdi = code function pointer
 # rdx = pointer to body cells (ignored if rcx == 0)
 # rcx = body_len
@@ -401,14 +421,17 @@ dict_add_builtin:
 dict_add:
     test r14, r14
     jz .dict_first
-    # next node begins immediately after previous node
-    mov rax, [r14 + 40]              # previous body_len
-    lea rax, [r14 + 56 + rax * 8]
+
+    # prev body end points at pre-node cell
+    # new node starts immediately after that
+    mov rax, [r14 + NODE_END]
+    add rax, 8
     jmp .dict_alloc
+
 .dict_first:
     lea rax, [rip + dict]
 .dict_alloc:
-    # exclusive end of new node
+    # body = rcx cells, followed by one prev-node cell
     lea r8, [rax + 56 + rcx * 8]
     lea r9, [rip + dict_end]
     cmp r8, r9
@@ -419,26 +442,141 @@ dict_add:
     movdqu xmm0, [rsi + 16]
     movdqu [rax + 16], xmm0
 .dict_add_code:
-    mov [rax + 32], rdi
-.dict_add_copy_len:
-    mov [rax + 40], rcx
-    lea r8, [rax + 48]
-    mov r9, rcx
+    mov [rax + NODE_CODE], rdi
 .dict_add_copy_body:
+    lea r8, [rax + NODE_BODY]
+    mov r9, rcx
     test r9, r9
     jz .dict_add_prev
+
     mov r10, [rdx]
     mov [r8], r10
     add rdx, 8
     add r8, 8
     dec r9
     jmp .dict_add_copy_body
+
 .dict_add_prev:
+    # r8 = end after body = body_end
+    mov [rax + NODE_END], r8
     mov [r8], r14
     mov r14, rax
     ret
 
+compile_ctrl_open:
+    lea rcx, [rip + ctrl_stack_end]
+    cmp rbx, rcx
+    jae fail_stack_overflow
+
+    lea rax, [rip + internal_ctrl_push]
+    mov [r12], rax
+
+    # runtime region 
+    lea rax, [r12 + 16]
+    lea rcx, [rbp + NODE_BODY]
+    sub rax, rcx
+    shr rax, 3
+
+    # start | end
+    mov [r12 + 8], eax
+    mov dword ptr [r12 + 12], 0
+
+    # comp state = ctrl_stack has descriptor address, not packed value!
+    lea rax, [r12 + 8]
+    mov [rbx], rax
+    add rbx, 8
+
+    add r12, 16
+    ret
+
 words:
+
+word_ctrl_open:
+    cmp qword ptr [rip + state], STATE_DEF
+    je .ctrl_open_nested
+
+    # for now only top level [ must have a named definition
+    # no anonymous top level regions yet...
+    lea rcx, [rip + ctrl_stack]
+    cmp rbx, rcx
+    jne fail_state
+
+    call read_token
+    lea rsi, [rip + token_buf]
+
+    # require :name
+    cmp byte ptr [rsi], ':'
+    jne fail_token_invalid
+    cmp byte ptr [rsi + 1], 0
+    je fail_token_invalid
+
+    # strip ':'
+    xor ecx, ecx
+
+.ctrl_name_shift:
+    mov al, byte ptr [rsi + rcx + 1]
+    mov byte ptr [rsi + rcx], al
+    inc rcx
+    test al, al
+    jne .ctrl_name_shift
+
+    lea rdi, [rip + word_exec]
+
+    # alloc empty dictionary def
+    # keep dictionary tail unset until ctrl_close
+    push r14
+    xor ecx, ecx
+    call dict_add
+    mov rbp, rax
+    pop r14
+
+    lea r12, [rbp + NODE_BODY]
+    mov qword ptr [rip + state], STATE_DEF
+    # fall through here, both modes compile ctrl open
+
+.ctrl_open_nested:
+    call compile_ctrl_open
+    ret
+
+word_ctrl_close:
+    cmp qword ptr [rip + state], STATE_DEF
+    jne fail_state
+
+    lea r8, [rip + ctrl_stack]
+    cmp rbx, r8
+    je fail_token_noopen
+
+    # runtime fall-through leaves region
+    lea rax, [rip + internal_ctrl_pop]
+    mov [r12], rax
+    add r12, 8
+
+    # pop compile-time descriptor pointer
+    sub rbx, 8
+    mov rax, [rbx]
+
+    # r12 = region end
+    lea rcx, [rbp + NODE_BODY]
+    mov rdx, r12
+    sub rdx, rcx
+    shr rdx, 3
+
+    # end = high 32 bits
+    mov [rax + 4], edx
+
+    # if another frame remains, close nested region
+    cmp rbx, r8
+    jne .ctrl_close_done
+
+    # else: if root, set dictionary word to dedicated registers
+    mov [rbp + NODE_END], r12
+    mov [r12], r14
+    mov r14, rbp
+
+    mov qword ptr [rip + state], STATE_EXE
+
+.ctrl_close_done:
+    ret
 
 word_dup:
     mov [r15], r13
@@ -464,66 +602,30 @@ word_over:
     mov r13, rax
     ret
 
-# r14 = current completed dict tail
-word_def:
-    cmp qword ptr [rip + state], STATE_EXE
-    jne fail_state
-    # reset branch stack in new def
-
-    lea rax, [rip + branch_stack]
-    mov [rip + branch_sp], rax
-
-    call read_token
-    lea rsi, [rip + token_buf]
-    lea rdi, [rip + word_exec]
-
-    # alloc empty definition
-    push r14
-    xor ecx, ecx
-    call dict_add
-    mov rbp, rax # rbp = def being compiled
-
-    # pop back old tail
-    pop r14
-    lea r12, [rbp + 48]
-    xor ebx, ebx # body_len
-
-    mov qword ptr [rip + state], STATE_DEF
-
-    ret
-
-word_end:
-    cmp qword ptr [rip + state], STATE_DEF
-    jne fail_state
-
-    lea rax, [rip + branch_stack]
-    cmp [rip + branch_sp], rax
-    jne fail_branch_noclose
-
-    mov [rbp + 40], rbx
-    mov [r12], r14
-    mov r14, rbp
-    mov qword ptr [rip + state], STATE_EXE
-    ret
-
 # rax = dictionary node being executed
 word_exec:
-    push r12
-    push rbx
-    mov rbx, [rax + 40] # body_len
-    lea r12, [rax + 48] # body
+    push rbp # body start
+    push r12 # current threaded inst ptr
+    push rbx # body end
+
+    mov rbp, rax
+    lea r12, [rax + NODE_BODY]
+
 .exec_next:
-    test rbx, rbx
+    cmp r12, [rbp + NODE_END]
     jz .exec_done
+
     mov rax, [r12] # next node
     add r12, 8
-    dec rbx
-    mov rdx, [rax + 32] # code
+
+    mov rdx, [rax + NODE_CODE] # code
     call rdx
     jmp .exec_next
+
 .exec_done:
     pop rbx
     pop r12
+    pop rbp
     ret
     
 word_add:
@@ -545,7 +647,7 @@ word_mul:
 
 word_write:
     mov rax, r13
-    lea rsi, [rip + write_buf + 32]
+    lea rsi, [rip + write_buf + TOKEN_MAX_LEN]
     dec rsi
     mov byte ptr [rsi], '\n'
 
@@ -575,7 +677,7 @@ word_write:
     dec rsi
     mov byte ptr [rsi], '-'
 .convert_output:
-    lea rdx, [rip + write_buf + 32]
+    lea rdx, [rip + write_buf + TOKEN_MAX_LEN]
     sub rdx, rsi
     call write
     sub r15, 8
@@ -608,13 +710,60 @@ word_lit:
     # next cell is data not ptr
     mov rax, [r12]
     add r12, 8
-    dec rbx
 
     # push lit to dat stack
     mov [r15], r13
     add r15, 8
     mov r13, rax
     ret
+
+# [r12] = packed control frame
+# CF=0 success
+# CF=1 stack full
+word_ctrl_push:
+    lea rcx, [rip + ctrl_stack_end]
+    cmp rbx, rcx
+    jae .ctrl_push_full
+
+    mov rax, [r12]
+    add r12, 8
+    mov [rbx], rax
+    add rbx, 8
+    clc
+    ret
+.ctrl_push_full:
+    stc
+    ret
+
+# RAX = popped packed control frame
+# CF=0 success
+# CF=1 stack empty
+word_ctrl_pop:
+    lea rcx, [rip + ctrl_stack]
+    cmp rbx, rcx
+    je .ctrl_pop_empty
+
+    sub rbx, 8
+    mov rax, [rbx]
+    clc
+    ret
+.ctrl_pop_empty:
+    stc
+    ret
+
+word_loop:
+    lea rcx, [rip + ctrl_stack]
+    cmp rbx, rcx
+    je fail_token_noopen
+
+    # peek start offset
+    mov eax, dword ptr [rbx - 8]
+
+    # jump there
+    lea rcx, [rbp + NODE_BODY]
+    lea r12, [rcx + rax * 8]
+    ret
+    
 
 word_sys:
     mov rax, [rip + reg_data + 0*8]
@@ -644,6 +793,7 @@ word_branch:
     cmp qword ptr [rip + state], STATE_DEF
     jne fail_state
 
+    # ? consumes one named word for arm
     call read_token
     lea rsi, [rip + token_buf]
     call find_word
@@ -651,86 +801,43 @@ word_branch:
 
     mov rdx, rax # arm cell
 
-    # emit hidden branch cell
     lea rax, [rip + internal_branch]
     mov [r12], rax
-    # emit arm cell
     mov [r12 + 8], rdx
-
-    # alloc skip count 
-    mov qword ptr [r12 + 16], 0
-
-    # push address of placehold onto branch stack
-    mov rcx, [rip + branch_sp]
-    lea r8, [rip + branch_stack_end]
-    cmp rcx, r8
-    jae fail_stack_overflow
-
-    lea rax, [r12 + 16]
-    mov [rcx], rax
-    add rcx, 8
-    mov [rip + branch_sp], rcx
-
-    # branch is 3 cells
-    add r12, 24
-    add rbx, 3
+    add r12, 16
     ret
 
 word_branch_runtime:
     mov rcx, r13       # flag
-    mov rax, [r12]     # arm cell
-    mov rdx, [r12 + 8] # skip count cell
-
-    # consume 2 operand cells
-    add r12, 16
-    sub rbx, 2
+    mov r8, [r12]      # arm cell
+    add r12, 8         # consume arm cell
 
     # consume flag
     sub r15, 8
     mov r13, [r15]
 
+    # false: leave branch frame active, continue
     test rcx, rcx
     jz .branch_runtime_done
 
-    # true: jump to end cell (first ?;)
-    lea r12, [r12 + rdx * 8]
-    sub rbx, rdx
+    # true: leave current [ ... ] region
+    call word_ctrl_pop
+    jc fail_token_noopen
 
-    mov rdx, [rax + 32]
+    # rax = packed ctrl start | end
+    shr rax, 32 # end offset
+
+    lea rcx, [rbp + NODE_BODY]
+    lea r12, [rcx + rax * 8]
+
+    # execute selected arm after branch continuation has been checked
+    mov rax, r8
+    mov rdx, [rax + NODE_CODE]
     call rdx
+
 .branch_runtime_done:
     ret
     
-word_branch_end:
-    cmp qword ptr [rip + state], STATE_DEF
-    jne fail_state
-
-    lea r8, [rip + branch_stack]
-    mov rcx, [rip + branch_sp]
-
-    cmp rcx, r8
-    je fail_branch_noopen
-
-.patch_next:
-    sub rcx, 8
-    mov rax, [rcx]
-
-    # r12 after consuming branch will point one cell beyond placeholder
-    lea rdx, [rax + 8]
-
-    # skip count = (join - after_branch) / 8
-    mov r9, r12
-    sub r9, rdx
-    shr r9, 3
-
-    mov [rax], r9
-
-    cmp rcx, r8
-    jne .patch_next
-
-    mov [rip + branch_sp], rcx
-    ret
-
 word_mask_and:
     sub r15, 8
     and r13, [r15]
@@ -779,7 +886,7 @@ words_end:
 #   CF=0 found
 #   CF=1 not found
 # Walks backward from r14 following last_ptr.
-# Returns the node start in rax so the caller can read code_len and iterate the code array
+# Returns the node start in rax so the caller can iterate the code array
 find_word:
     mov rdx, r14
 .find_next:
@@ -795,8 +902,8 @@ find_word:
     inc rcx
     jmp .find_compare
 .find_prev:
-    mov rcx, [rdx + 40] # body_len
-    mov rdx, [rdx + 48 + rcx * 8] # prev
+    mov rcx, [rdx + NODE_END] # body_end
+    mov rdx, [rcx] # prev
     jmp .find_next
 .find_found:
     mov rax, rdx
@@ -815,28 +922,27 @@ eval_token:
     call find_word
     jc .eval_literal
 
-    mov rdx, [rax + 32]
+    mov rdx, [rax + NODE_CODE]
 
     cmp qword ptr [rip + state], STATE_EXE
     je .eval_exec
 
     # state = def
-    lea rcx, [rip + word_end]
-    cmp rdx, rcx
-    je .eval_exec
-
     lea rcx, [rip + word_branch]
     cmp rdx, rcx
     je .eval_exec
 
-    lea rcx, [rip + word_branch_end]
+    lea rcx, [rip + word_ctrl_open]
+    cmp rdx, rcx
+    je .eval_exec
+
+    lea rcx, [rip + word_ctrl_close]
     cmp rdx, rcx
     je .eval_exec
 
     # any other word: compile
     mov [r12], rax
     add r12, 8
-    inc rbx
     ret
 
 .eval_exec:
@@ -868,19 +974,18 @@ eval_token:
     mov [r12], rax
     mov [r12 + 8], rdx
     add r12, 16
-    add rbx, 2
     ret
     
 .global _start
 _start:
     xor r14d, r14d # dict must be null (0) for first dict_add call
     lea r15, [rip + data_stack]
+    lea rbx, [rip + ctrl_stack]
 
     # load builtins into dict
 .load_builtins:
     # internals
     lea rax, [rip + internal_branch]
-    mov [rip + branch_sp], rax
 
     # global
     
@@ -896,11 +1001,11 @@ _start:
     lea rsi, [rip + token_over]
     lea rdi, [rip + word_over]
     call dict_add_builtin
-    lea rsi, [rip + token_def]
-    lea rdi, [rip + word_def]
+    lea rsi, [rip + token_ctrl_open]
+    lea rdi, [rip + word_ctrl_open]
     call dict_add_builtin
-    lea rsi, [rip + token_end]
-    lea rdi, [rip + word_end]
+    lea rsi, [rip + token_ctrl_close]
+    lea rdi, [rip + word_ctrl_close]
     call dict_add_builtin
     lea rsi, [rip + token_add]
     lea rdi, [rip + word_add]
@@ -950,9 +1055,8 @@ _start:
     lea rsi, [rip + token_shr]
     lea rdi, [rip + word_shr]
     call dict_add_builtin
-
-    lea rsi, [rip + token_branch_end]
-    lea rdi, [rip + word_branch_end]
+    lea rsi, [rip + token_loop]
+    lea rdi, [rip + word_loop]
     call dict_add_builtin
 
     # load embedded bootstrap code
@@ -999,17 +1103,16 @@ fail_token_overflow:
     mov rax, E_LEN
     lea rsi, [rip + err_token_len]
     jmp fail
+fail_token_noclose:
+    mov rax, E_SYN
+    lea rsi, [rip + err_token_noclose]
+    jmp fail
+fail_token_noopen:
+    mov rax, E_SYN
+    lea rsi, [rip + err_token_noopen]
+    jmp fail
 fail_state:
     mov rax, E_SYN
     lea rsi, [rip + err_state]
     jmp fail
-fail_branch_noclose:
-    mov rax, E_SYN
-    lea rsi, [rip + err_branch_noclose]
-    jmp fail
-fail_branch_noopen:
-    mov rax, E_SYN
-    lea rsi, [rip + err_branch_noopen]
-    jmp fail
-    
-    
+        

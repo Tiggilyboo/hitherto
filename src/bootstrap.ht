@@ -1,32 +1,32 @@
 # read: fd buf count -> result
 # Linux syscall 0
-: read
+[ :read
     $3 !        # count
     $2 !        # buffer address
     $1 !        # file descriptor
     0 $0 !      # SYS_read
     sys
     $0 @        # return value
-;
+]
 
 # write: fd buf count -> result
 # Linux syscall 1
-: write
+[ :write
     $3 !        # count
     $2 !        # buffer address
     $1 !        # file descriptor
     1 $0 !      # SYS_write
     sys
     $0 @        # return value
-;
+]
 
 # exit: status -> nothing
 # Linux syscall 60
-: exit
+[ :exit
     $1 !        # exit status
     60 $0 !     # SYS_exit
     sys
-;
+]
 
 # must end on newline
 
