@@ -13,9 +13,9 @@
 .equ TOKEN_MAX_LEN, 31
 .equ TOKEN_SIZE,    32
 
-.equ NODE_CODE, 32
-.equ NODE_END,  40
-.equ NODE_BODY, 48
+.equ NODE_CODE, 0
+.equ NODE_END,  8
+.equ NODE_BODY, 16
 
 .equ CONTROL_MAX,   64
 
@@ -131,16 +131,12 @@ err_state:
 
 .align 8
 internal_lit:
-    .zero TOKEN_SIZE
     .quad word_lit
 internal_branch:
-    .zero TOKEN_SIZE
     .quad word_branch_runtime
 internal_ctrl_push:
-    .zero TOKEN_SIZE
     .quad word_ctrl_push
 internal_ctrl_pop:
-    .zero TOKEN_SIZE
     .quad word_ctrl_pop
 
 bootstrap:
@@ -404,66 +400,139 @@ read_token:
 
 # rsi = pointer to TOKEN_MAX_LEN-byte name
 # rdi = code function pointer
-#
 # returns:
 #   rax = new dictionary node address
 dict_add_builtin:
-    xor edx, edx
-    xor ecx, ecx
     call dict_add
     ret
 
-# r14 = dictionary tail, null if empty
-# rsi = pointer to TOKEN_MAX_LEN-byte name
+# rsi = null-terminated name
 # rdi = code function pointer
-# rdx = pointer to body cells (ignored if rcx == 0)
-# rcx = body_len
-#
 # returns:
-#   rax = new dictionary node address
+#   rax = new global dictionary node
 dict_add:
-    test r14, r14
-    jz .dict_first
+    # Global dictionary's current tail.
+    mov rdx, r14
 
-    # prev body end points at pre-node cell
-    # new node starts immediately after that
-    mov rax, [r14 + NODE_END]
-    add rax, 8
-    jmp .dict_alloc
+    # For the first global node, supply the dictionary arena base.
+    test rdx, rdx
+    jnz .dict_add_node
 
-.dict_first:
-    lea rax, [rip + dict]
-.dict_alloc:
-    # body = rcx cells, followed by one prev-node cell
-    lea r8, [rax + 56 + rcx * 8]
-    lea r9, [rip + dict_end]
-    cmp r8, r9
-    ja fail_dict_overflow
-.dict_add_copy_name:
-    movdqu xmm0, [rsi]
-    movdqu [rax], xmm0
-    movdqu xmm0, [rsi + 16]
-    movdqu [rax + 16], xmm0
-.dict_add_code:
-    mov [rax + NODE_CODE], rdi
-.dict_add_copy_body:
-    lea r8, [rax + NODE_BODY]
-    mov r9, rcx
-    test r9, r9
-    jz .dict_add_prev
+    lea r8, [rip + dict]
 
-    mov r10, [rdx]
-    mov [r8], r10
-    add rdx, 8
-    add r8, 8
-    dec r9
-    jmp .dict_add_copy_body
+.dict_add_node:
+    call node_add
 
-.dict_add_prev:
-    # r8 = end after body = body_end
-    mov [rax + NODE_END], r8
-    mov [r8], r14
+    # Publish as new global tail.
     mov r14, rax
+    ret
+
+# rsi = null-terminated name
+# rdi = code function pointer
+# rdx = previous node in this dictionary, 0 if first
+# r8  = allocation address if rdx == 0
+# returns:
+#   rax = new node
+#   r8  = first free byte after new node's prev-pointer cell
+#
+# node layout:
+#
+#   +0   NODE_CODE
+#   +8   NODE_END
+#   +16  NODE_BODY
+#          +0   packed name { start, end }
+#          +8   name bytes
+#               padding to 8-byte boundary
+#          +N   local dictionary tail
+#          +N+8 payload
+#               ...
+#   NODE_END:
+#          previous-node pointer
+node_add:
+    # Determine new node address.
+    test rdx, rdx
+    jz .node_first
+
+    mov rax, [rdx + NODE_END]
+    add rax, 8
+    jmp .node_alloc
+
+.node_first:
+    mov rax, r8
+
+.node_alloc:
+    # Measure source name.
+    xor ecx, ecx
+
+.node_name_len:
+    cmp byte ptr [rsi + rcx], 0
+    je .node_name_len_done
+    inc rcx
+    jmp .node_name_len
+
+.node_name_len_done:
+    # Aligned offset immediately after:
+    #
+    #   packed descriptor (8 bytes)
+    #   name bytes
+    #
+    # align8(8 + len) = (len + 15) & -8
+    lea r10, [rcx + 15]
+    and r10, -8
+
+    # Payload begins after local-tail qword.
+    lea r8, [rax + NODE_BODY + r10 + 8]
+
+    # NODE_END currently equals payload start.
+    # Need one more qword for previous-node pointer.
+    lea r9, [r8 + 8]
+    lea r11, [rip + dict_end]
+    cmp r9, r11
+    ja fail_dict_overflow
+
+    # Runtime behavior.
+    mov [rax + NODE_CODE], rdi
+
+    # Name descriptor:
+    #   low32  = 8
+    #   high32 = 8 + name length
+    mov r11d, ecx
+    add r11d, 8
+    shl r11, 32
+    or r11, 8
+    mov [rax + NODE_BODY], r11
+
+    # Copy exact name bytes.
+    # No terminating NUL is stored.
+    xor r9d, r9d
+
+.node_name_copy:
+    cmp r9, rcx
+    je .node_name_done
+
+    mov r11b, byte ptr [rsi + r9]
+    mov byte ptr [rax + NODE_BODY + 8 + r9], r11b
+    inc r9
+    jmp .node_name_copy
+
+.node_name_done:
+    # Recompute aligned name end.
+    lea r10, [rcx + 15]
+    and r10, -8
+
+    # New node begins with an empty local dictionary.
+    mov qword ptr [rax + NODE_BODY + r10], 0
+
+    # Payload / physical end of this currently-empty node.
+    lea r8, [rax + NODE_BODY + r10 + 8]
+
+    mov [rax + NODE_END], r8
+
+    # Link to previous node in whichever dictionary owns this node.
+    mov [r8], rdx
+
+    # Return next free byte after the prev-pointer cell.
+    add r8, 8
     ret
 
 compile_ctrl_open:
@@ -478,7 +547,6 @@ compile_ctrl_open:
     lea rax, [r12 + 16]
     lea rcx, [rbp + NODE_BODY]
     sub rax, rcx
-    shr rax, 3
 
     # start | end
     mov [r12 + 8], eax
@@ -528,15 +596,17 @@ word_ctrl_open:
     # alloc empty dictionary def
     # keep dictionary tail unset until ctrl_close
     push r14
-    xor ecx, ecx
     call dict_add
     mov rbp, rax
     pop r14
 
-    lea r12, [rbp + NODE_BODY]
-    mov qword ptr [rip + state], STATE_DEF
-    # fall through here, both modes compile ctrl open
+    mov rax, rbp
+    call node_payload
+    mov r12, rax
 
+    mov qword ptr [rip + state], STATE_DEF
+
+    # fall through here, both modes compile ctrl open
 .ctrl_open_nested:
     call compile_ctrl_open
     ret
@@ -562,7 +632,6 @@ word_ctrl_close:
     lea rcx, [rbp + NODE_BODY]
     mov rdx, r12
     sub rdx, rcx
-    shr rdx, 3
 
     # end = high 32 bits
     mov [rax + 4], edx
@@ -572,9 +641,7 @@ word_ctrl_close:
     jne .ctrl_close_done
 
     # else: if root, set dictionary word to dedicated registers
-    mov [rbp + NODE_END], r12
-    mov [r12], r14
-    mov r14, rbp
+    call node_finalize
 
     mov qword ptr [rip + state], STATE_EXE
 
@@ -607,25 +674,37 @@ word_over:
 
 # rax = dictionary node being executed
 word_exec:
-    push rbp # body start
-    push r12 # current threaded inst ptr
-    push rbx # body end
+    push rbp
+    push r12
+    push rbx
 
     mov rbp, rax
-    lea r12, [rax + NODE_BODY]
+
+    # r12 = start of node payload
+    call node_payload
+    mov r12, rax
+
+    # Root payload currently begins:
+    #   +8  packed root start|end
+    mov rax, [r12 + 8]
+    shr rax, 32
+
+    lea rcx, [rbp + NODE_BODY]
+    lea rax, [rcx + rax]
+    push rax
 
 .exec_next:
-    cmp r12, [rbp + NODE_END]
-    jz .exec_done
+    cmp r12, [rsp]
+    je .exec_done
 
-    mov rax, [r12] # next node
+    mov rax, [r12]
     add r12, 8
-
-    mov rdx, [rax + NODE_CODE] # code
+    mov rdx, [rax + NODE_CODE]
     call rdx
     jmp .exec_next
 
 .exec_done:
+    add rsp, 8
     pop rbx
     pop r12
     pop rbp
@@ -764,7 +843,7 @@ word_loop:
 
     # jump there
     lea rcx, [rbp + NODE_BODY]
-    lea r12, [rcx + rax * 8]
+    lea r12, [rcx + rax]
     ret
 
 word_break:
@@ -776,7 +855,7 @@ word_break:
 
     # jump there
     lea rcx, [rbp + NODE_BODY]
-    lea r12, [rcx + rax * 8]
+    lea r12, [rcx + rax]
     ret
 
 word_sys:
@@ -887,36 +966,116 @@ word_shr:
 
 words_end:
 
-# rsi = pointer to null-terminated token
-# r14 = dict tail (most recent node starte, null when empty)
+# rdx = node
 # returns:
-#   rax = node start ptr
+#   rax = name byte address
+#   rcx = exact name length
+node_name:
+    mov r8, [rdx + NODE_BODY]
+    # start
+    mov eax, r8d
+    # end
+    shr r8, 32
+    # rcx = end - start
+    sub r8d, eax
+    mov ecx, r8d
+    lea rax, [rdx + NODE_BODY + rax]
+    ret
+
+node_payload:
+    mov rcx, [rax + NODE_BODY]
+    shr rcx, 32
+    add rcx, 7
+    and rcx, -8
+
+    # Skip local-tail qword.
+    lea rax, [rax + NODE_BODY + rcx + 8]
+    ret
+
+# rax = node
+# returns:
+#   rax = tail of node-local dictionary
+#         0 if no local definitions exist
+node_locals:
+    mov rcx, [rax + NODE_BODY]
+    shr rcx, 32
+    add rcx, 7
+    and rcx, -8
+
+    # Local-tail qword is immediately after aligned name.
+    mov rax, [rax + NODE_BODY + rcx]
+    ret
+
+# rbp = node
+# r12 = current physical end
+# r14 = previous published dictionary tail
+node_finalize:
+    mov [rbp + NODE_END], r12
+    mov [r12], r14
+    mov r14, rbp
+    ret
+
+# rsi = null-terminated token
+# returns:
+#   rax = matching node
 #   CF=0 found
 #   CF=1 not found
-# Walks backward from r14 following last_ptr.
-# Returns the node start in rax so the caller can iterate the code array
 find_word:
     mov rdx, r14
+    jmp find_from
+
+# rsi = null-terminated token
+# rdx = dictionary tail
+# returns:
+#   rax = matching node
+#   CF=0 found
+#   CF=1 not found
+find_from:
+    # token length
+    xor r9d, r9d
+
+.find_token_len:
+    cmp byte ptr [rsi + r9], 0
+    je .find_token_len_done
+    inc r9
+    jmp .find_token_len
+
+.find_token_len_done:
+
 .find_next:
     test rdx, rdx
     jz .find_missing
-    xor ecx, ecx
-.find_compare:
-    mov al, byte ptr [rsi + rcx]
-    cmp al, byte ptr [rdx + rcx]
+
+    # rax = candidate name address
+    # rcx = candidate name length
+    call node_name
+
+    cmp rcx, r9
     jne .find_prev
-    test al, al
-    jz .find_found
-    inc rcx
+
+    xor r10d, r10d
+
+.find_compare:
+    cmp r10, r9
+    je .find_found
+
+    mov cl, byte ptr [rsi + r10]
+    cmp cl, byte ptr [rax + r10]
+    jne .find_prev
+
+    inc r10
     jmp .find_compare
+
 .find_prev:
-    mov rcx, [rdx + NODE_END] # body_end
-    mov rdx, [rcx] # prev
+    mov rcx, [rdx + NODE_END]
+    mov rdx, [rcx]
     jmp .find_next
+
 .find_found:
     mov rax, rdx
     clc
     ret
+
 .find_missing:
     stc
     ret
@@ -986,7 +1145,7 @@ eval_token:
     
 .global _start
 _start:
-    xor r14d, r14d # dict must be null (0) for first dict_add call
+    xor r14d, r14d # dict must be null (0) for first node_add call
     lea r15, [rip + data_stack]
     lea rbx, [rip + ctrl_stack]
 
