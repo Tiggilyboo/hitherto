@@ -98,7 +98,10 @@ token_shr:
     .asciz ">>"
     .skip 29
 token_loop:
-    .asciz "~"
+    .asciz "~["
+    .skip 29
+token_break:
+    .asciz "~]"
     .skip 29
 
 err_unknown:
@@ -763,7 +766,18 @@ word_loop:
     lea rcx, [rbp + NODE_BODY]
     lea r12, [rcx + rax * 8]
     ret
-    
+
+word_break:
+    call word_ctrl_pop
+    jc fail_token_noopen
+
+    # popped frame: end offset
+    shr rax, 32
+
+    # jump there
+    lea rcx, [rbp + NODE_BODY]
+    lea r12, [rcx + rax * 8]
+    ret
 
 word_sys:
     mov rax, [rip + reg_data + 0*8]
@@ -821,14 +835,8 @@ word_branch_runtime:
     jz .branch_runtime_done
 
     # true: leave current [ ... ] region
-    call word_ctrl_pop
-    jc fail_token_noopen
-
-    # rax = packed ctrl start | end
-    shr rax, 32 # end offset
-
-    lea rcx, [rbp + NODE_BODY]
-    lea r12, [rcx + rax * 8]
+    # TODO: This might be redesigned when we have better locals / anonymous control regions
+    call word_break
 
     # execute selected arm after branch continuation has been checked
     mov rax, r8
@@ -1057,6 +1065,9 @@ _start:
     call dict_add_builtin
     lea rsi, [rip + token_loop]
     lea rdi, [rip + word_loop]
+    call dict_add_builtin
+    lea rsi, [rip + token_break]
+    lea rdi, [rip + word_break]
     call dict_add_builtin
 
     # load embedded bootstrap code

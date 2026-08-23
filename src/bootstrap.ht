@@ -1,3 +1,4 @@
+
 # read: fd buf count -> result
 # Linux syscall 0
 [ :read
@@ -18,6 +19,17 @@
     1 $0 !      # SYS_write
     sys
     $0 @        # return value
+]
+
+# open: filename -> fd
+# Linux syscall 2
+[ :open
+    0 $2 !      # mode
+    0 $1 !      # O_RDONLY
+    $0 !        # filename address
+    2 $0 !      # SYS_open
+    sys
+    $0 @        # return fd
 ]
 
 # exit: status -> nothing
