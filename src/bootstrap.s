@@ -11,7 +11,6 @@
 .equ STATE_DEF, 1
 
 .equ TOKEN_MAX_LEN, 31
-.equ TOKEN_SIZE,    32
 
 .equ NODE_CODE, 0
 .equ NODE_END,  8
@@ -30,79 +29,58 @@
 
 token_dup:
     .asciz "^"
-    .skip 30
 token_drop:
     .asciz "_"
-    .skip 30
 token_swap:
     .asciz "><"
-    .skip 29
 token_over:
     .asciz "<^"
-    .skip 29
 token_ctrl_open:
     .asciz "["
-    .skip 30
 token_ctrl_close:
     .asciz "]"
-    .skip 30
 token_add:
     .asciz "+"
-    .skip 30
 token_sub:
     .asciz "-"
-    .skip 30
 token_mul:
     .asciz "*"
-    .skip 30
 token_div:
     .asciz "/"
-    .skip 30
 token_write:
     .asciz "."
-    .skip 30
 token_tick:
     .asciz "'"
-    .skip 30
 token_sys:
     .asciz "sys"
-    .skip 28
 token_store:
     .asciz "!"
-    .skip 30
 token_load:
     .asciz "@"
-    .skip 30
 token_ign:
     .asciz "#"
-    .skip 30
 token_branch:
     .asciz "?"
-    .skip 30
 token_mask_and:
     .asciz "&"
-    .skip 30
 token_mask_or:
     .asciz "|"
-    .skip 30
 token_eq:
     .asciz "="
-    .skip 30
 token_lt:
     .asciz "<"
-    .skip 30
 token_shl:
     .asciz "<<"
-    .skip 29
 token_shr:
     .asciz ">>"
-    .skip 29
 token_loop:
     .asciz "~["
-    .skip 29
 token_break:
     .asciz "~]"
-    .skip 29
+token_pack:
+    .asciz "pack"
+token_span:
+    .asciz "span"
 
 err_unknown:
     .asciz "Unknown error occurred\n"
@@ -138,6 +116,8 @@ internal_ctrl_push:
     .quad word_ctrl_push
 internal_ctrl_pop:
     .quad word_ctrl_pop
+internal_packed_bind:
+    .quad word_packed_bind
 
 bootstrap:
     .incbin "src/bootstrap.ht"
@@ -155,7 +135,7 @@ io_char:
 write_buf:
     .skip TOKEN_MAX_LEN
 token_buf:
-    .skip TOKEN_SIZE
+    .skip TOKEN_MAX_LEN + 1
 
 .align 8
 ctrl_stack:
@@ -397,15 +377,6 @@ read_token:
     xor eax, eax
     ret
     
-
-# rsi = pointer to TOKEN_MAX_LEN-byte name
-# rdi = code function pointer
-# returns:
-#   rax = new dictionary node address
-dict_add_builtin:
-    call dict_add
-    ret
-
 # rsi = null-terminated name
 # rdi = code function pointer
 # returns:
@@ -414,16 +385,19 @@ dict_add:
     # Global dictionary's current tail.
     mov rdx, r14
 
-    # For the first global node, supply the dictionary arena base.
-    test rdx, rdx
-    jnz .dict_add_node
+    # Dictionary link?
+    test r14, r14
+    jz .dict_add_first
 
+    mov r8, [r14 + NODE_END]
+    add r8, 8
+    jmp .dict_add_node
+
+.dict_add_first:
     lea r8, [rip + dict]
-
+    
 .dict_add_node:
     call node_add
-
-    # Publish as new global tail.
     mov r14, rax
     ret
 
@@ -433,37 +407,12 @@ dict_add:
 # r8  = allocation address if rdx == 0
 # returns:
 #   rax = new node
-#   r8  = first free byte after new node's prev-pointer cell
-#
-# node layout:
-#
-#   +0   NODE_CODE
-#   +8   NODE_END
-#   +16  NODE_BODY
-#          +0   packed name { start, end }
-#          +8   name bytes
-#               padding to 8-byte boundary
-#          +N   local dictionary tail
-#          +N+8 payload
-#               ...
-#   NODE_END:
-#          previous-node pointer
+#   r8  = physical allocation address
 node_add:
-    # Determine new node address.
-    test rdx, rdx
-    jz .node_first
-
-    mov rax, [rdx + NODE_END]
-    add rax, 8
-    jmp .node_alloc
-
-.node_first:
     mov rax, r8
 
-.node_alloc:
     # Measure source name.
     xor ecx, ecx
-
 .node_name_len:
     cmp byte ptr [rsi + rcx], 0
     je .node_name_len_done
@@ -799,6 +748,80 @@ word_lit:
     mov r13, rax
     ret
 
+# Compile-time only
+word_packed:
+    cmp qword ptr [rip + state], STATE_DEF
+    jne fail_state
+
+    lea rcx, [rip + ctrl_stack]
+    cmp rbx, rcx
+    je fail_token_noopen
+
+    # control region start
+    mov rax, [rbx - 8]
+    mov eax, dword ptr [rax]
+
+    lea rcx, [rbp + NODE_BODY]
+    lea rdx, [rcx + rax]
+
+    # must being with packed record
+    lea rax, [rip + internal_packed_bind]
+    cmp qword ptr [rdx], rax
+    jne fail_token_invalid
+
+    # only once
+    cmp qword ptr [rdx + 24], 0
+    jne fail_token_invalid
+
+    # skip to current compiled position (past locals)
+    mov rax, r12
+    sub rax, rcx
+    mov [rdx + 24], rax
+    ret
+
+# Runtime:
+#  r12 = mutable source qword
+#  r12 + 8 = packed mask
+#  r12 + 16 = byte offset after inline local nodes
+# Pops TOS into source cell, skips compile time local node data embedded in instruction stream
+word_packed_bind:
+    lea rax, [rip + data_stack]
+    cmp r15, rax
+    je fail_stack_underflow
+
+    mov [r12], r13
+    sub r15, 8
+    mov r13, [r15]
+
+    # skip source/mask/local-node data
+    mov rax, [r12 + 16]
+    lea rcx, [rbp + NODE_BODY]
+    lea r12, [rcx + rax]
+    ret
+
+# rax = packed-local node
+# Push selected value 0 extends to bit 0
+word_packed_local:
+    call node_payload
+    mov rcx, [rax] # source address
+    mov rdx, [rax + 8] # mask
+
+    mov rax, [rcx]
+    and rax, rdx
+
+    test rdx, rdx
+    jz .packed_local_push
+
+    # shift and normalize mask offset
+    bsf rcx, rdx
+    shr rax, cl
+
+.packed_local_push:
+    mov [r15], r13
+    add r15, 8
+    mov r13, rax
+    ret
+
 # [r12] = packed control frame
 # CF=0 success
 # CF=1 stack full
@@ -889,7 +912,7 @@ word_branch:
     # ? consumes one named word for arm
     call read_token
     lea rsi, [rip + token_buf]
-    call find_word
+    call find_scope
     jc fail_notfound
 
     mov rdx, rax # arm cell
@@ -994,16 +1017,87 @@ node_payload:
 
 # rax = node
 # returns:
-#   rax = tail of node-local dictionary
-#         0 if no local definitions exist
-node_locals:
+#   rax = address of node-local dictionary tail cell
+node_locals_ref:
     mov rcx, [rax + NODE_BODY]
     shr rcx, 32
     add rcx, 7
     and rcx, -8
 
     # Local-tail qword is immediately after aligned name.
-    mov rax, [rax + NODE_BODY + rcx]
+    lea rax, [rax + NODE_BODY + rcx]
+    ret
+
+# rax = node
+# returns:
+#   rax = root packed record address
+#   CF=0 if node's root region begins with packed
+#   CF=0 doesn't
+node_packed_record:
+    mov rdx, rax
+    call node_payload
+
+    # compiled words start with ctrl push function
+    lea rcx, [rip + internal_ctrl_push]
+    cmp qword ptr [rax], rcx
+    jne .node_packed_missing
+
+    # region start byte offset
+    mov eax, dword ptr [rax + 8]
+    lea rcx, [rdx + NODE_BODY]
+    lea rax, [rcx + rax]
+
+    # packed def has it's record at start of root region
+    lea rcx, [rip + internal_packed_bind]
+    cmp qword ptr [rax], rcx
+    jne .node_packed_missing
+
+    clc
+    ret
+.node_packed_missing:
+    stc
+    ret
+
+# rax = source node
+# returns:
+#   rax = mask
+node_mask:
+    mov rdx, [rax + NODE_CODE]
+    lea rcx, [rip + word_packed_local]
+    cmp rdx, rcx
+    je .node_mask_local
+
+    # should expose full mask without using it (lazy)
+    push rax
+    call node_packed_record
+    jc .node_mask_execute
+
+    mov rax, [rax + 16] # packed record full mask
+    add rsp, 8
+    ret
+.node_mask_execute:
+    pop rax
+    # ordinary source: execute pop TOS as mask
+    mov rdx, [rax + NODE_CODE]
+    call rdx
+
+    mov r8, r13
+    call word_drop
+    mov rax, r8
+    ret
+
+.node_mask_local:
+    call node_payload
+    mov rax, [rax + 8] # applied mask
+
+    # convert mask back to bit-0 form (shifted)
+    test rax, rax
+    jz .node_mask_done
+
+    bsf rcx, rax
+    shr rax, cl
+
+.node_mask_done:
     ret
 
 # rbp = node
@@ -1014,6 +1108,31 @@ node_finalize:
     mov [r12], r14
     mov r14, rbp
     ret
+
+# rsi = null terminated token
+# STATE_COMP: Search current node locals first, locals eventally point back to r14
+#   From r14 we can continue following through all globals backwards
+# STATE_DEF: Search global dict
+# returns:
+#   rax = matching node
+#   CF = 0 found
+#   CF = 1 not found
+find_scope:
+    cmp qword ptr [rip + state], STATE_DEF
+    jne .find_scope_global
+
+    mov rax, rbp
+    call node_locals_ref
+    mov rdx, [rax]
+
+    test rdx, rdx
+    jz .find_scope_global
+
+    jmp find_from
+
+.find_scope_global:
+    mov rdx, r14
+    jmp find_from
 
 # rsi = null-terminated token
 # returns:
@@ -1080,13 +1199,196 @@ find_from:
     stc
     ret
 
+# rsi = token string in "type:name" pattern
+# rcx = index of ':' character
+# emits packed local node at r12
+# stack format:
+#[rsp + 0]   applied mask
+#[rsp + 8]   packed record
+#[rsp + 16]  provider node
+#[rsp + 24]  local-name pointer
+compile_packed_local:
+    test rcx, rcx
+    jz fail_token_invalid
+
+    cmp byte ptr [rsi + rcx + 1], 0
+    je fail_token_invalid
+
+    # split token
+    mov byte ptr [rsi + rcx], 0
+    lea rax, [rsi + rcx + 1]
+    push rax # local name
+
+    # resolve source in current scope
+    call find_scope
+    jc fail_notfound
+
+    push rax # source
+
+    call node_mask
+    mov r10, rax # mask
+
+    # control region must exist
+    lea rcx, [rip + ctrl_stack]
+    cmp rbx, rcx
+    je fail_token_noopen
+
+    # region start
+    mov rax, [rbx - 8]
+    mov eax, dword ptr [rax]
+
+    lea rcx, [rbp + NODE_BODY]
+    lea r11, [rcx + rax]
+
+    # reserve packed record
+    lea rax, [rip + internal_packed_bind]
+    cmp qword ptr [r11], rax
+    je .packed_record_exists
+
+    # TODO: Can this restriction be lifted?
+    # No code may be before packed declarations
+    cmp r12, r11
+    jne fail_token_invalid
+
+    mov [r12], rax # internal_packed_bind
+    mov qword ptr [r12 + 8], 0 # source
+    mov qword ptr [r12 + 16], 0 # full mask
+    mov qword ptr [r12 + 24], 0 # end offset
+    add r12, 32
+
+.packed_record_exists:
+    # finalized packed record has no more declarations
+    cmp qword ptr [r11 + 24], 0
+    jne fail_token_invalid
+
+    push r11 # packed record
+
+    # dense placement after highest occupied bit of full mask
+    mov rax, [r11 + 16]
+    xor ecx, ecx
+
+    test rax, rax
+    jz .packed_shift_ready
+
+    bsr rcx, rax
+    inc rcx
+
+.packed_shift_ready:
+    # zero = no bits
+    test r10, r10
+    jz .packed_mask_zero
+
+    # mask can't do more than qword (yet)
+    cmp rcx, 64
+    jae fail_token_invalid
+
+    mov r9, r10
+    shl r9, cl
+
+    # reject everything after 64 bit word
+    mov rax, r9
+    shr rax, cl
+    cmp rax, r10
+    jne fail_token_invalid
+
+    jmp .packed_mask_ready
+
+.packed_mask_zero:
+    xor r9d, r9d
+.packed_mask_ready:
+    or [r11 + 16], r9
+
+    push r9 # applied mask
+
+    # add tail
+    mov rax, rbp
+    call node_locals_ref
+
+    mov rdx, [rax]
+    test rdx, rdx
+    jnz .packed_have_prev
+
+    # first local falls through to global ref (so we can continue iterating globals to resolve the name)
+    mov rdx, r14
+
+.packed_have_prev:
+    # emit local node into compiled body
+    mov r8, r12
+    mov rsi, [rsp + 24] # local name
+    lea rdi, [rip + word_packed_local]
+    call node_add
+
+    mov r10, rax # new node
+    mov rcx, [r10 + NODE_END]
+    mov rdx, [rcx] # prev node
+
+    # node_add prev pointer is at NODE_END, offset to quads to local payload
+    lea rax, [rcx + 24]
+    lea r11, [rip + dict_end]
+    cmp rax, r11
+    ja fail_dict_overflow
+
+    # local payload
+    mov r11, [rsp + 8] # packed record
+    lea r11, [r11 + 8] # source qword
+    mov [rcx], r11
+
+    mov r11, [rsp] # applied mask
+    mov [rcx + 8], r11
+
+    # new physical end = prev-pointer
+    lea r11, [rcx + 16]
+    mov [r10 + NODE_END], r11
+    mov [r11], rdx
+
+    lea r12, [r11 + 8]
+
+    # inherit nested locals (join refs TODO?)
+    mov rax, r10
+    call node_locals_ref
+    mov r11, rax
+
+    # source node
+    mov rax, [rsp + 16]
+    call node_locals_ref
+    mov rax, [rax]
+    mov [r11], rax
+
+    # publish latest local of owning word
+    mov rax, rbp
+    call node_locals_ref
+    mov [rax], r10
+    add rsp, 32
+    ret
+
 # exe + word => execute
 # exe + literal => push
 # def + word => compile cell
 # def + lit => compile lit + value
 eval_token:
+    cmp qword ptr [rip + state], STATE_DEF
+    jne .eval_lookup
+
     lea rsi, [rip + token_buf]
-    call find_word
+    xor ecx, ecx
+
+.eval_colon_scan:
+    mov al, byte ptr [rsi + rcx]
+    test al, al
+    jz .eval_lookup
+
+    cmp al, ':'
+    je .eval_packed_local
+    inc rcx
+    jmp .eval_colon_scan
+
+.eval_packed_local:
+    call compile_packed_local
+    ret
+
+.eval_lookup:
+    lea rsi, [rip + token_buf]
+    call find_scope
     jc .eval_literal
 
     mov rdx, [rax + NODE_CODE]
@@ -1104,6 +1406,10 @@ eval_token:
     je .eval_exec
 
     lea rcx, [rip + word_ctrl_close]
+    cmp rdx, rcx
+    je .eval_exec
+
+    lea rcx, [rip + word_packed]
     cmp rdx, rcx
     je .eval_exec
 
@@ -1158,76 +1464,79 @@ _start:
     
     lea rsi, [rip + token_dup]
     lea rdi, [rip + word_dup]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_drop]
     lea rdi, [rip + word_drop]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_swap]
     lea rdi, [rip + word_swap]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_over]
     lea rdi, [rip + word_over]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_ctrl_open]
     lea rdi, [rip + word_ctrl_open]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_ctrl_close]
     lea rdi, [rip + word_ctrl_close]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_add]
     lea rdi, [rip + word_add]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_sub]
     lea rdi, [rip + word_sub]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_mul]
     lea rdi, [rip + word_mul]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_div]
     lea rdi, [rip + word_div]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_write]
     lea rdi, [rip + word_write]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_tick]
     lea rdi, [rip + word_tick]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_sys]
     lea rdi, [rip + word_sys]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_store]
     lea rdi, [rip + word_store]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_load]
     lea rdi, [rip + word_load]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_branch]
     lea rdi, [rip + word_branch]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_mask_and]
     lea rdi, [rip + word_mask_and]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_mask_or]
     lea rdi, [rip + word_mask_or]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_eq]
     lea rdi, [rip + word_eq]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_lt]
     lea rdi, [rip + word_lt]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_shl]
     lea rdi, [rip + word_shl]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_shr]
     lea rdi, [rip + word_shr]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_loop]
     lea rdi, [rip + word_loop]
-    call dict_add_builtin
+    call dict_add
     lea rsi, [rip + token_break]
     lea rdi, [rip + word_break]
-    call dict_add_builtin
+    call dict_add
+    lea rsi, [rip + token_pack]
+    lea rdi, [rip + word_packed]
+    call dict_add
 
     # load embedded bootstrap code
     lea rax, [rip + bootstrap]
