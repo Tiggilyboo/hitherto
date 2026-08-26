@@ -86,6 +86,8 @@ token_break:
     .asciz "~]"
 token_immediate:
     .asciz "immediate"
+token_asm:
+    .asciz "asm"
 
 err_unknown:
     .asciz "Unknown error occurred\n"
@@ -296,6 +298,56 @@ parse_int:
     stc
     ret
 
+# rsi = null term token
+# returns:
+# rax = byte value
+# CF = 0 success
+# CF = 1 not two hex digits
+parse_hex_byte:
+    xor eax, eax
+    xor ecx, ecx
+
+.hex_next:
+    movzx edx, byte ptr [rsi + rcx]
+    test dl, dl
+    jz .hex_done
+
+    # byte has at most 2 digits
+    cmp ecx, 2
+    jae .hex_invalid
+
+    # 0-9
+    cmp dl, '0'
+    jb .hex_alpha
+    cmp dl, '9'
+    jbe .hex_digit
+.hex_alpha:
+    or dl, 0x20 # A-F to a-f
+    cmp dl, 'a'
+    jb .hex_invalid
+    cmp dl, 'f'
+    ja .hex_invalid
+
+    sub dl, 'a' - 10
+    jmp .hex_append
+.hex_digit:
+    sub dl, '0'
+
+.hex_append:
+    shl eax, 4
+    movzx edx, dl
+    or eax, edx
+    inc rcx
+    jmp .hex_next
+.hex_done:
+    cmp ecx, 2
+    jne .hex_invalid
+    clc
+    ret
+.hex_invalid:
+    stc
+    ret
+
 # RSI -> null-terminated token
 # returns:
 #   RAX = literal value
@@ -325,6 +377,17 @@ parse_literal:
     ret
 
 .literal_number:
+    cmp byte ptr [rsi], '0'
+    jne .literal_decimal
+
+    cmp byte ptr [rsi + 1], 'x'
+    jne .literal_decimal
+
+    add rsi, 2
+    call parse_hex_byte
+    ret
+
+.literal_decimal:
     call parse_int
     ret
 
@@ -1068,6 +1131,37 @@ word_immediate:
     jne fail_state
     or qword ptr [rbp + NODE_FLAGS], NODE_IMMEDIATE
     ret
+
+# TODO VALIDATE
+# ( byte0 ... byteN-1 count -- )
+word_asm:
+    mov rcx, r13          # count
+
+    test rcx, rcx
+    js fail_token_invalid
+
+    # Drop count; next value becomes TOS.
+    sub r15, 8
+    mov r13, [r15]
+
+    # Ensure every input is a byte.
+.asm_check:
+    test rcx, rcx
+    jz .asm_done
+
+    cmp r13, 255
+    ja fail_token_invalid
+
+    dec rcx
+    test rcx, rcx
+    jz .asm_done
+
+    sub r15, 8
+    mov r13, [r15]
+    jmp .asm_check
+
+.asm_done:
+    ret
     
 
 words_end:
@@ -1381,6 +1475,10 @@ _start:
     call dict_add
     lea rsi, [rip + token_immediate]
     lea rdi, [rip + word_immediate]
+    or qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
+    call dict_add
+    lea rsi, [rip + token_asm]
+    lea rdi, [rip + word_asm]
     or qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
     call dict_add
 
