@@ -40,5 +40,12 @@
     sys
 ]
 
+# standard types
+[ :u8
+    [ :@
+        [ 0x4d 0x0f 0xb6 0x6d 0x00 asm ]
+    ]
+]
+
 # must end on newline
 

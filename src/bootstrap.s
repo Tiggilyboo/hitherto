@@ -13,17 +13,22 @@
 .equ TOKEN_MAX_LEN, 31
 
 .equ NODE_CODE, 0
-.equ NODE_IMMEDIATE, 1
-.equ NODE_FLAGS, 8
+.equ NODE_TYPE, 8
 .equ NODE_END,  16
 .equ NODE_BODY, 24
+.equ NODE_IMMEDIATE_MASK, 1
+.equ NODE_FLAGS_MASK, 7
+.equ NODE_TYPE_MASK, -8
 
 # Max depth of scope stack depth
 .equ SCOPE_MAX, 64
-
-# compile-time scope stack tag
+# compile-time scope stack tags
 # all real pointers stored here are 8 byte aligned
-.equ SCOPE_DEF_TAG, 1
+# pointer = enclosing scope owner, used for nested definition return / lookups
+.equ SCOPE_PARENT_TAG, 1
+# pointer = declaration type currently being constructed, used by constructors
+.equ SCOPE_TYPE_TAG, 2
+.equ SCOPE_TAG_MASK, 7
 
 .equ E_EOF, -1
 .equ E_LEN, -2
@@ -88,6 +93,8 @@ token_immediate:
     .asciz "immediate"
 token_asm:
     .asciz "asm"
+token_type:
+    .asciz "type"
 
 err_unknown:
     .asciz "Unknown error occurred\n"
@@ -501,6 +508,58 @@ parse_declaration:
 .decl_invalid:
     stc
     ret
+
+# rsi = null term token
+# returns:
+#  rax = scope string
+#  rsi = member string
+#  CF = 0 valid
+#  CF = 1 invalid
+# clobbers:
+#  rax, rcx, rdx
+# side effects: replaces '~' with null on success
+parse_member:
+    mov rax, rsi
+.member_scan:
+    mov dl, byte ptr [rax]
+    test dl, dl
+    jz .member_invalid
+    cmp dl, '~'
+    je .member_split
+
+    inc rax
+    jmp .member_scan
+.member_split:
+    # scope non-empty
+    cmp rax, rsi
+    je .member_invalid
+    # member must not be empty
+    lea rcx, [rax + 1]
+    cmp byte ptr [rcx], 0
+    je .member_invalid
+
+.member_tail:
+    mov dl, byte ptr [rcx]
+    test dl, dl
+    jz .member_done
+
+    # TODO: only one scope member jump for now
+    cmp dl, '~'
+    je .member_invalid
+
+    inc rcx
+    jmp .member_tail
+    
+.member_done:
+    mov byte ptr [rax], 0
+    lea rdx, [rax + 1]
+    mov rax, rsi
+    mov rsi, rdx
+    clc
+    ret
+.member_invalid:
+    stc
+    ret
     
 # rsi = null-terminated name
 # rdi = code function pointer
@@ -567,7 +626,7 @@ node_add:
     # Runtime behavior.
     mov [rax + NODE_CODE], rdi
 
-    mov qword ptr [rax + NODE_FLAGS], 0
+    mov qword ptr [rax + NODE_TYPE], 0
 
     # Name descriptor:
     #   low32  = 8
@@ -636,6 +695,69 @@ compile_ctrl_open:
     add r12, 16
     ret
 
+# rbp = parent scope node
+# r12 = parent physical compile end
+# rsi = child name
+# rdi = child code
+# returns:
+#  rax = unpublished child node
+#  r10 = parent's internal_skip patch cell
+# clobbers:
+#  rcx, rdx, r8, r9, r11
+compile_child_declaration:
+    # skip inline child node
+    lea rax, [rip + internal_skip]
+    mov [r12], rax
+
+    lea rax, [r12 + 8]
+    mov qword ptr [rax], 0
+
+    # preserve skip patch for node_add
+    push rax
+
+    add r12, 16
+    # inline child 
+    mov r8, r12
+
+    # link current tail of parent scope dict
+    mov rax, rbp
+    call node_locals_ref
+    mov rdx, [rax]
+
+    call node_add
+
+    pop r10
+    ret
+
+# rbp = child node
+# r12 = child physical end
+# r9 = parent scope node
+# r10 = parent internal_skip patch cell
+# returns:
+#  rbp = parent
+# r12 = parent compile resumes
+compile_child_publish:
+    # prev tail of parent's scope dict
+    mov rax, r9
+    call node_locals_ref
+    mov r11, rax
+    mov rdx, [rax]
+
+    call node_finalize
+    mov [r11], rbp
+
+    # resume after child's prev-pointer
+    add r12, 8
+
+    # patch internal skip
+    mov rax, r12
+    lea rcx, [r9 + NODE_BODY]
+    sub rax, rcx
+    mov [r10], rax
+
+    mov rbp, r9
+    ret
+
 words:
 
 word_ctrl_open:
@@ -694,33 +816,18 @@ word_ctrl_open:
     cmp rdx, rcx
     ja fail_stack_overflow
 
-    # parent runtime skips the inline child def
-    lea rax, [rip + internal_skip]
-    mov [r12], rax
-
-    lea rax, [r12 + 8] # skip patch cell
-    mov qword ptr [rax], 0
-    add r12, 16
-
-    # save child def boundary on scope stack
-    mov [rbx], rax # skip patch ref
-    add rbx, 8
-
-    mov rax, rbp
-    or rax, SCOPE_DEF_TAG
-    mov [rbx], rax # tagged parent
-    add rbx, 8
-
-    # alloc child in parent's body
-    mov r8, r12
-
-    # prev child in parent's scoped dict
-    mov rax, rbp
-    call node_locals_ref
-    mov rdx, [rax]
-
     lea rdi, [rip + word_exec]
-    call node_add
+    call compile_child_declaration
+
+    # rax = child
+    # r10 = parent's skip patch 
+    mov [rbx], r10
+    add rbx, 8
+
+    mov rdx, rbp
+    or rdx, SCOPE_PARENT_TAG
+    mov [rbx], rdx
+    add rbx, 8
 
     # compile into child
     mov rbp, rax
@@ -765,7 +872,7 @@ word_ctrl_close:
     je .ctrl_close_global
 
     # tagged entry underneath: root of child def
-    test qword ptr [rbx - 8], SCOPE_DEF_TAG
+    test qword ptr [rbx - 8], SCOPE_PARENT_TAG
     jnz .ctrl_close_child
 
     # anonymouse control region, nothing to do
@@ -777,40 +884,12 @@ word_ctrl_close:
     mov qword ptr [rip + state], STATE_EXE
     ret
 .ctrl_close_child:
-    # rbx - 8 = parent rbp | SCOPE_DEF_TAG
     mov r9, [rbx - 8]
     and r9, -2
-
-    # rbx - 16 = parents skip patch cell
     mov r10, [rbx - 16]
-
-    # current tail of parent's child dictionary
-    mov rax, r9
-    call node_locals_ref
-    mov r11, rax
-    mov rdx, [rax]
-
-    # rbp = child
-    call node_finalize
-
-    # publish child into parent scope
-    mov [r11], rbp
-
-    # node_finalize puts [r12] = prev child pointer
-    # parent threaded code reset here
-    add r12, 8
-
-    # patch parent internal_skip target
-    mov rax, r12
-    lea rcx, [r9 + NODE_BODY]
-    sub rax, rcx
-    mov [r10], rax
-
-    # Consume skip-ref + tagged parent ptr
+    # consume skip-ref + tagged parent
     sub rbx, 16
-
-    # resume parent compilation
-    mov rbp, r9
+    call compile_child_publish
     ret
 
 # [r12] = byte offset relative to rbp + NODE_BODY
@@ -1147,7 +1226,7 @@ word_shr:
 word_immediate:
     cmp qword ptr [rip + state], STATE_DEF
     jne fail_state
-    or qword ptr [rbp + NODE_FLAGS], NODE_IMMEDIATE
+    or qword ptr [rbp + NODE_TYPE], NODE_IMMEDIATE_MASK
     ret
 
 # [ 0x12 0x23 0x34 asm ]
@@ -1224,6 +1303,16 @@ word_asm:
     add r12, 16
     ret
 
+word_type:
+    call scope_target
+    jc fail_state
+    call node_type
+
+    mov [r15], r13
+    add r15, 8
+    mov r13, rax
+    ret
+
 words_end:
 
 # rdx = node
@@ -1231,14 +1320,13 @@ words_end:
 #   rax = name byte address
 #   rcx = exact name length
 node_name:
-    mov r8, [rdx + NODE_BODY]
+    mov rcx, [rdx + NODE_BODY]
     # start
-    mov eax, r8d
-    # end
-    shr r8, 32
-    # rcx = end - start
-    sub r8d, eax
-    mov ecx, r8d
+    mov eax, ecx
+    # end - start
+    shr rcx, 32
+    sub ecx, eax
+
     lea rax, [rdx + NODE_BODY + rax]
     ret
 
@@ -1265,6 +1353,14 @@ node_locals_ref:
     lea rax, [rax + NODE_BODY + rcx]
     ret
 
+# rax = node
+# returns:
+#   rax = node type, 0 for none
+node_type:
+    mov rax, [rax + NODE_TYPE]
+    and rax, NODE_TYPE_MASK
+    ret
+
 # rbp = node
 # r12 = current physical end
 # rdx = previous node in owning dictionary
@@ -1273,59 +1369,108 @@ node_finalize:
     mov [r12], rdx
     ret
 
+# returns:
+#  rax = target node
+#  CF = 0 found
+#  CF = 1 not
+scope_target:
+    mov rcx, rbx
+    lea rdx, [rip + scope_stack] 
+
+.scope_target_next:
+    cmp rcx, rdx
+    je .scope_target_missing
+    sub rcx, 8
+    mov rax, [rcx]
+
+    test rax, SCOPE_TYPE_TAG
+    jz .scope_target_next
+
+    and rax, -8
+    clc
+    ret
+.scope_target_missing:
+    stc
+    ret
+
+# r8 = scope owning node
+# rsi = token
+# Search order: owner's dict, owner's type dict, type's type dict
+# Does not search parent scopes.
+# returns:
+#   rax = matching node
+#   CF = 0 found
+#   CF = 1 not found
+find_scope_local:
+.scope_local_next:
+    mov rax, r8
+    call node_locals_ref
+    mov rdx, [rax]
+
+    test rdx, rdx
+    jz .scope_local_type
+
+    call find_dict
+    jnc .scope_local_done
+
+.scope_local_type:
+    mov rax, r8
+    call node_type
+
+    test rax, rax
+    jz .scope_local_missing
+
+    mov r8, rax
+    jmp .scope_local_next
+
+.scope_local_done:
+    ret
+.scope_local_missing:
+    stc
+    ret
+
 # rsi = null terminated token
-# Search current definition's child scope siblings, then globals
+# Search order in STATE_DEF
+#   node dictionary
+#   node's type dictionary
+#   types' type dictionary
 # returns:
 #   rax = matching node
 #   CF = 0 found
 #   CF = 1 not found
 find_scope:
     cmp qword ptr [rip + state], STATE_DEF
-    jne .find_scope_global
+    jne .find_scope_root
 
-    # current def scop
-    mov rax, rbp
-    call node_locals_ref
-    mov rdx, [rax]
+    mov r11, rbx
+    mov r8, rbp
 
-    test rdx, rdx
-    jz .find_scope_parents
-
-    call find_from
+.find_scope_next:
+    call find_scope_local
     jnc .find_scope_done
 
-.find_scope_parents:
-    # walk compile-time scope stack backwards
-    # tagged qwords are enclosing def nodes
-    mov r11, rbx
-
-.find_scope_parent_next:
+.find_scope_parent:
     lea rcx, [rip + scope_stack]
     cmp r11, rcx
-    je .find_scope_global
+    je .find_scope_root
 
     sub r11, 8
     mov rax, [r11]
 
-    test rax, SCOPE_DEF_TAG
-    jz .find_scope_parent_next
+    test rax, SCOPE_PARENT_TAG
+    jz .find_scope_parent
 
-    # decode parent node
+    # existing def boundary entry identifies the parent scope
     and rax, -2
+    mov r8, rax
+    jmp .find_scope_next
 
-    # search parents child dict
-    call node_locals_ref
-    mov rdx, [rax]
-    test rdx, rdx
-    jz .find_scope_parent_next
+.find_scope_root:
+    mov rdx, r14
+    jmp find_dict
 
-    call find_from
-    jc .find_scope_parent_next
 .find_scope_done:
     ret
-.find_scope_global:
-    mov rdx, r14
-    jmp find_from
 
 # rsi = null-terminated token
 # returns:
@@ -1334,15 +1479,16 @@ find_scope:
 #   CF=1 not found
 find_word:
     mov rdx, r14
-    jmp find_from
+    jmp find_dict
 
 # rsi = null-terminated token
 # rdx = dictionary tail
+# Searches one dictionary chain
 # returns:
 #   rax = matching node
 #   CF=0 found
 #   CF=1 not found
-find_from:
+find_dict:
     # token length
     xor r9d, r9d
 
@@ -1399,14 +1545,32 @@ find_from:
 eval_token:
     lea rsi, [rip + token_buf]
     call find_scope
+    jnc .eval_word
+
+    # then try scope~member
+    lea rsi, [rip + token_buf]
+    call parse_member
     jc .eval_literal
 
+    push rsi
+    mov rsi, rax
+    call find_scope
+    pop rsi
+    jc fail_notfound
+
+    # rax = scope node
+    # rsi = member string
+    mov r8, rax
+    call find_scope_local
+    jc fail_notfound
+
+.eval_word:
     mov rdx, [rax + NODE_CODE]
     cmp qword ptr [rip + state], STATE_EXE
     je .eval_exec
 
     # def: execute immediates
-    test qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
+    test qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
     jnz .eval_exec
 
     # any other word: compile
@@ -1432,10 +1596,77 @@ eval_token:
     mov r13, rax
     ret
 
+.eval_declaration:
+    lea rsi, [rip + token_buf]
+    call parse_declaration
+    jc fail_notfound
+
+    test rax, rax
+    jz fail_token_invalid
+
+    # rax = type string
+    # rsi = declaration name
+    push rsi
+    mov rsi, rax
+    call find_scope
+    pop rsi
+    jc fail_notfound
+
+    push rax
+    push rbp
+
+    lea rdi, [rip + word_exec]
+    call compile_child_declaration
+
+    # rax = target child
+    # target.NODE_TYPE = type
+    mov rcx, [rsp + 8]
+    mov [rax + NODE_TYPE], rcx
+
+    # r10 = parent skip patch
+    push r10
+
+    # child is now phisical compilation context
+    mov rbp, rax
+    mov rax, rbp
+    call node_payload
+    mov r12, rax
+
+    # push constructor target
+    lea rcx, [rip + scope_stack_end]
+    cmp rbx, rcx
+    jae fail_stack_overflow
+
+    mov rax, rbp
+    or rax, SCOPE_TYPE_TAG
+    mov [rbx], rax
+    add rbx, 8
+
+    # exec the type as a constructor
+    # stack:
+    #  [rsp] = skip patch
+    #  [rsp + 8] = parent
+    #  [rsp + 16] = type
+    mov rax, [rsp + 16]
+    mov rdx, [rax + NODE_CODE]
+    call rdx
+
+    # constructor should leav scope balanced
+    sub rbx, 8
+
+    # restore child publication context (no longer target scope)
+    pop r10
+    pop r9
+    # discard saved type
+    add rsp, 8 
+
+    call compile_child_publish
+    ret
+
 .def_literal:
     lea rsi, [rip + token_buf]
     call parse_literal
-    jc fail_notfound
+    jc .eval_declaration
 
     mov rdx, rax
     lea rax, [rip + internal_lit]
@@ -1457,7 +1688,6 @@ _start:
     lea rax, [rip + internal_branch]
 
     # global
-    
     lea rsi, [rip + token_dup]
     lea rdi, [rip + word_dup]
     call dict_add
@@ -1470,14 +1700,6 @@ _start:
     lea rsi, [rip + token_over]
     lea rdi, [rip + word_over]
     call dict_add
-    lea rsi, [rip + token_ctrl_open]
-    lea rdi, [rip + word_ctrl_open]
-    call dict_add
-    or qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
-    lea rsi, [rip + token_ctrl_close]
-    lea rdi, [rip + word_ctrl_close]
-    call dict_add
-    or qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
     lea rsi, [rip + token_add]
     lea rdi, [rip + word_add]
     call dict_add
@@ -1505,10 +1727,6 @@ _start:
     lea rsi, [rip + token_load]
     lea rdi, [rip + word_load]
     call dict_add
-    lea rsi, [rip + token_branch]
-    lea rdi, [rip + word_branch]
-    call dict_add
-    or qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
     lea rsi, [rip + token_mask_and]
     lea rdi, [rip + word_mask_and]
     call dict_add
@@ -1533,14 +1751,35 @@ _start:
     lea rsi, [rip + token_break]
     lea rdi, [rip + word_break]
     call dict_add
+    lea rsi, [rip + token_type]
+    lea rdi, [rip + word_type]
+    call dict_add
+
+    # immediates
+    lea rsi, [rip + token_ctrl_open]
+    lea rdi, [rip + word_ctrl_open]
+    call dict_add
+    or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
+
+    lea rsi, [rip + token_ctrl_close]
+    lea rdi, [rip + word_ctrl_close]
+    call dict_add
+    or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
+
+    lea rsi, [rip + token_branch]
+    lea rdi, [rip + word_branch]
+    call dict_add
+    or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
+
     lea rsi, [rip + token_immediate]
     lea rdi, [rip + word_immediate]
-    or qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
     call dict_add
+    or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
+
     lea rsi, [rip + token_asm]
     lea rdi, [rip + word_asm]
     call dict_add
-    or qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
+    or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
     # load embedded bootstrap code
     lea rax, [rip + bootstrap]
