@@ -125,6 +125,8 @@ internal_ctrl_pop:
     .quad word_ctrl_pop
 internal_skip:
     .quad word_skip
+internal_native:
+    .quad word_native
 
 bootstrap:
     .incbin "src/bootstrap.ht"
@@ -161,6 +163,15 @@ input_end:
 dict:
     .skip 131072
 dict_end:
+
+.section .native,"awx",@progbits
+.align 16
+native_buf:
+    .skip 4096
+native_buf_end:
+.section .data
+native_here:
+    .quad native_buf
 
 .section .text
 
@@ -962,6 +973,13 @@ word_lit:
     mov r13, rax
     ret
 
+# [r12] = native entry address
+word_native:
+    mov rax, [r12]
+    add r12, 8
+    # we entered from invoked call, must jump
+    jmp rax 
+
 # [r12] = packed control frame
 # CF=0 success
 # CF=1 stack full
@@ -1132,37 +1150,79 @@ word_immediate:
     or qword ptr [rbp + NODE_FLAGS], NODE_IMMEDIATE
     ret
 
-# TODO VALIDATE
-# ( byte0 ... byteN-1 count -- )
+# [ 0x12 0x23 0x34 asm ]
+# Immediate: Consumes all words in the scope
 word_asm:
-    mov rcx, r13          # count
+    cmp qword ptr [rip + state], STATE_DEF
+    jne fail_state
 
-    test rcx, rcx
-    js fail_token_invalid
+    lea rcx, [rip + scope_stack]
+    cmp rbx, rcx
+    je fail_token_noopen
 
-    # Drop count; next value becomes TOS.
-    sub r15, 8
-    mov r13, [r15]
+    # top scope entry is current scope
+    mov rax, [rbx - 8]
+    mov eax, dword ptr [rax]
+    lea rcx, [rbp + NODE_BODY]
 
-    # Ensure every input is a byte.
-.asm_check:
-    test rcx, rcx
-    jz .asm_done
+    # compiled litral iterator
+    lea r8, [rcx + rax]
+    mov r9, r12 # current end
 
-    cmp r13, 255
+    # native entry
+    mov r10, [rip + native_here]
+    # native write cursor
+    mov r11, r10 
+
+    lea rdx, [rip + internal_lit]
+.asm_next:
+    cmp r8, r9
+    je .asm_ret
     ja fail_token_invalid
 
-    dec rcx
-    test rcx, rcx
-    jz .asm_done
+    # validate: either lit or qword value
+    cmp qword ptr [r8], rdx
+    jne fail_token_invalid
 
-    sub r15, 8
-    mov r13, [r15]
-    jmp .asm_check
+    # must be a byte
+    mov rax, [r8 + 8]
+    cmp rax, 255
+    ja fail_token_invalid
 
-.asm_done:
+    lea rcx, [rip + native_buf_end]
+    cmp r11, rcx
+    # TODO: Better error
+    jae fail_dict_overflow
+
+    mov [r11], al
+    inc r11
+
+    add r8, 16
+    jmp .asm_next
+
+.asm_ret:
+    # ret to threaded caller
+    lea rcx, [rip + native_buf_end]
+    cmp r11, rcx
+    jae fail_dict_overflow
+
+    mov byte ptr [r11], 0xc3
+    inc r11
+    mov [rip + native_here], r11
+
+.asm_consume:
+    # reset region body start
+    mov rax, [rbx - 8]
+    mov eax, dword ptr [rax]
+    lea rcx, [rbp + NODE_BODY]
+    lea r12, [rcx + rax]
+
+    # replace literals with: internal_native entry addresses
+    lea rax, [rip + internal_native]
+    mov [r12], rax
+    mov [r12 + 8], r10
+    add r12, 16
     ret
-    
 
 words_end:
 
@@ -1479,8 +1539,8 @@ _start:
     call dict_add
     lea rsi, [rip + token_asm]
     lea rdi, [rip + word_asm]
-    or qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
     call dict_add
+    or qword ptr [rax + NODE_FLAGS], NODE_IMMEDIATE
 
     # load embedded bootstrap code
     lea rax, [rip + bootstrap]
