@@ -26,8 +26,8 @@
 # all real pointers stored here are 8 byte aligned
 # pointer = enclosing scope owner, used for nested definition return / lookups
 .equ SCOPE_PARENT_TAG, 1
-# pointer = declaration type currently being constructed, used by constructors
-.equ SCOPE_TYPE_TAG, 2
+# pointer = dynamic accessor / closure environment, used by constructors, or jump to member calls and inherited member dispatch
+.equ SCOPE_CONTEXT_TAG, 2
 .equ SCOPE_TAG_MASK, 7
 
 .equ E_EOF, -1
@@ -134,6 +134,8 @@ internal_skip:
     .quad word_skip
 internal_native:
     .quad word_native
+internal_member_dispatch:
+    .quad word_member_dispatch
 
 bootstrap:
     .incbin "src/bootstrap.ht"
@@ -151,7 +153,7 @@ io_char:
 write_buf:
     .skip TOKEN_MAX_LEN
 token_buf:
-    .skip TOKEN_MAX_LEN + 1
+    .skip TOKEN_MAX_LEN
 
 .align 8
 scope_stack:
@@ -263,51 +265,55 @@ fail:
     call write_err
     jmp exit
 
-# RSI -> null terminated token
+# rsi = integer bytes
+# r9  = byte length
 # returns:
-#   RAX = signed integer
-#   CF=0 success
-#   CF=1 not a valid integer
+#   rax = signed integer
+#   CF = 0 success
+#   CF = 1 invalid
 parse_int:
     xor eax, eax
     xor edi, edi
-    cmp byte ptr [rsi], '-'
-    jne .require_digit
-    mov edi, 1 # negative
-    inc rsi
 
-.require_digit:
-    cmp byte ptr [rsi], 0
+    test r9, r9
+    jz .int_bad
+
+    xor ecx, ecx
+    cmp byte ptr [rsi], '-'
+    jne .int_loop
+
+    mov edi, 1
+    inc rcx
+
+    # '-' alone is invalid
+    cmp rcx, r9
     je .int_bad
 
 .int_loop:
-    movzx edx, byte ptr [rsi]
+    cmp rcx, r9
+    je .int_done
 
-    # End of string = successful parse
-    test dl, dl
-    jz .int_done
+    movzx edx, byte ptr [rsi + rcx]
 
-    # ASCII -> digit
     sub edx, '0'
     cmp edx, 9
     ja .int_bad
 
-    # number *= 10
     imul rax, rax, 10
     jo .int_bad
 
-    # Add/subtract digit according to sign
     test edi, edi
     jnz .int_negative
 
     add rax, rdx
     jo .int_bad
     jmp .int_next
+
 .int_negative:
     sub rax, rdx
     jo .int_bad
 .int_next:
-    inc rsi
+    inc rcx
     jmp .int_loop
 .int_done:
     clc
@@ -316,31 +322,32 @@ parse_int:
     stc
     ret
 
-# rsi = null term token
+# rsi = hex bytes
+# r9 = byte length
 # returns:
-# rax = byte value
-# CF = 0 success
-# CF = 1 not two hex digits
+#   rax = byte value
+#   CF = 0 success
+#   CF = 1 invalid
 parse_hex_byte:
+    cmp r9, 2
+    jne .hex_invalid
+
     xor eax, eax
     xor ecx, ecx
 
 .hex_next:
+    cmp rcx, r9
+    je .hex_done
+
     movzx edx, byte ptr [rsi + rcx]
-    test dl, dl
-    jz .hex_done
 
-    # byte has at most 2 digits
-    cmp ecx, 2
-    jae .hex_invalid
-
-    # 0-9
     cmp dl, '0'
     jb .hex_alpha
     cmp dl, '9'
     jbe .hex_digit
+
 .hex_alpha:
-    or dl, 0x20 # A-F to a-f
+    or dl, 0x20
     cmp dl, 'a'
     jb .hex_invalid
     cmp dl, 'f'
@@ -348,6 +355,7 @@ parse_hex_byte:
 
     sub dl, 'a' - 10
     jmp .hex_append
+
 .hex_digit:
     sub dl, '0'
 
@@ -355,36 +363,42 @@ parse_hex_byte:
     shl eax, 4
     movzx edx, dl
     or eax, edx
+
     inc rcx
     jmp .hex_next
+
 .hex_done:
-    cmp ecx, 2
-    jne .hex_invalid
     clc
     ret
 .hex_invalid:
     stc
     ret
 
-# RSI -> null-terminated token
+# rsi = null-terminated token
 # returns:
-#   RAX = literal value
+#   rax = literal value
 #   CF=0 success
 #   CF=1 not a literal
-# literals:
-#   123     -> 123
-#   -123    -> -123
-#   $N      -> $reg_data[N]
 parse_literal:
+    test r9, r9
+    jz .literal_bad
+
     cmp byte ptr [rsi], '$'
     jne .literal_number
 
-    # Register literal: $N
+    # '$' must have a value after it
+    cmp r9, 1
+    je .literal_bad
+
+    push rsi
+    push r9
     inc rsi
+    dec r9
     call parse_int
+    pop r9
+    pop rsi
     jc .literal_bad
 
-    # reg_data is currently 8 cells / 64 bytes
     cmp rax, 7
     ja .literal_bad
 
@@ -395,24 +409,33 @@ parse_literal:
     ret
 
 .literal_number:
+    # needs at least 0x..
+    cmp r9, 2
+    jb .literal_decimal
+
     cmp byte ptr [rsi], '0'
     jne .literal_decimal
-
     cmp byte ptr [rsi + 1], 'x'
     jne .literal_decimal
 
+    push rsi
+    push r9
     add rsi, 2
+    sub r9, 2
     call parse_hex_byte
+    pop r9
+    pop rsi
     ret
 
 .literal_decimal:
     call parse_int
     ret
-
 .literal_bad:
     stc
     ret
 
+# rsi = token address
+# r9 = token length
 read_token:
     xor rcx, rcx
 .skip_ws:
@@ -458,110 +481,144 @@ read_token:
 
     jmp .next
 .done:
-    # null-terminate
-    mov byte ptr [rip + token_buf + rcx], 0
+    lea rsi, [rip + token_buf]
+    mov r9, rcx
     xor eax, eax
     ret
 
-# rsi = null-terminated declaration token
+# rsi = declaration bytes
+# r9 = declaration length
 # returns:
-#   rax = prefix string, 0 if none
-#   rsi = name string
+#   rax = type address, 0 if none
+#   r8 = type length, 0 if none
+#   rsi = name address
+#   r9 = name length
 #   CF = 0 valid
 #   CF = 1 invalid
-# Side effects:
-#   Drops prefix ':'
-#   Replaces split in 'prefix:name' with null for easy assignment
 parse_declaration:
     xor ecx, ecx
 .decl_scan:
-    mov dl, byte ptr [rsi + rcx]
-    test dl, dl
+    cmp rcx, r9
     jz .decl_invalid
 
-    cmp dl, ':'
+    cmp byte ptr [rsi + rcx], ':'
     je .decl_colon
 
     inc rcx
     jmp .decl_scan
 
 .decl_colon:
-    cmp byte ptr [rsi + rcx + 1], 0
-    je .decl_invalid
-    # split type and name
-    mov byte ptr [rsi + rcx], 0
-    lea rdx, [rsi + rcx + 1] # name
-    # empty type = :name
-    test rcx, rcx
-    jz .decl_no_type
+    # name must contain at least one byte
+    lea rdx, [rcx + 1]
+    cmp rdx, r9
+    jae .decl_invalid
 
-    mov rax, rsi # type
-    mov rsi, rdx # name
-    clc
-    ret
+    # type span
+    mov rax, rsi
+    mov r8, rcx
 
-.decl_no_type:
+    # name span
+    lea rsi, [rsi + rcx + 1]
+    sub r9, rcx
+    dec r9
+
+    # no type
+    test r8, r8
+    jnz .decl_done
+
     xor eax, eax
-    mov rsi, rdx
+.decl_done:
     clc
     ret
+    
 .decl_invalid:
     stc
     ret
 
-# rsi = null term token
+# rax = type address, 0 if none
+# r8 = type length
+# rsi = declaration name address
+# r9 = declaration name length
 # returns:
-#  rax = scope string
-#  rsi = member string
+#  rdx = resolved type node, 0 if none
+resolve_declaration_type:
+    xor edx, edx
+
+    test rax, rax
+    jz .resolve_decl_done
+
+    push rsi
+    push r9
+    mov rsi, rax
+    mov r9, r8
+    call find_scope
+    pop r9
+    pop rsi
+    jc fail_notfound
+
+    mov rdx, rax
+.resolve_decl_done:
+    ret
+
+# rsi = token address
+# r9 = token length
+# returns:
+#  rax = scope address
+#  r8 = scope length
+#  rsi = member address
+#  r9 = member length
 #  CF = 0 valid
 #  CF = 1 invalid
-# clobbers:
-#  rax, rcx, rdx
-# side effects: replaces '~' with null on success
 parse_member:
-    mov rax, rsi
+    xor ecx, ecx
+
 .member_scan:
-    mov dl, byte ptr [rax]
-    test dl, dl
-    jz .member_invalid
-    cmp dl, '~'
+    cmp rcx, r9
+    je .member_invalid
+
+    cmp byte ptr [rsi + rcx], '~'
     je .member_split
 
-    inc rax
+    inc rcx
     jmp .member_scan
+
 .member_split:
     # scope non-empty
-    cmp rax, rsi
+    test rcx, rcx
     je .member_invalid
     # member must not be empty
-    lea rcx, [rax + 1]
-    cmp byte ptr [rcx], 0
+    lea rdx, [rcx + 1]
+    cmp rdx, r9
     je .member_invalid
 
+    # preserve scope length
+    mov r8, rcx
+    mov rcx, rdx
+
 .member_tail:
-    mov dl, byte ptr [rcx]
-    test dl, dl
+    cmp rcx, r9
     jz .member_done
 
     # TODO: only one scope member jump for now
-    cmp dl, '~'
+    cmp byte ptr [rsi + rcx], '~'
     je .member_invalid
 
     inc rcx
     jmp .member_tail
     
 .member_done:
-    mov byte ptr [rax], 0
-    lea rdx, [rax + 1]
     mov rax, rsi
-    mov rsi, rdx
+    lea rsi, [rsi + r8 + 1]
+    sub r9, r8
+    dec r9
     clc
     ret
 .member_invalid:
     stc
     ret
     
-# rsi = null-terminated name
+# rsi = name address
+# r9 = name length
 # rdi = code function pointer
 # returns:
 #   rax = new global dictionary node
@@ -585,7 +642,21 @@ dict_add:
     mov r14, rax
     ret
 
-# rsi = null-terminated name
+# rsi = name address null terminated
+# rdi = code function pointer
+# returns:
+#   rsi = name address
+#   r9 = name length
+# overload for dict_add for length resolution from asciz
+dict_add_z:
+    push rdi
+    call len
+    pop rdi
+    mov r9, rax
+    jmp dict_add
+
+# rsi = name address
+# r9 = name length
 # rdi = code function pointer
 # rdx = previous node in this dictionary, 0 if first
 # r8  = allocation address if rdx == 0
@@ -594,25 +665,8 @@ dict_add:
 #   r8  = physical allocation address
 node_add:
     mov rax, r8
-
-    # Measure source name.
-    xor ecx, ecx
-.node_name_len:
-    cmp byte ptr [rsi + rcx], 0
-    je .node_name_len_done
-    inc rcx
-    jmp .node_name_len
-
-.node_name_len_done:
-    # Aligned offset immediately after:
-    #
-    #   packed descriptor (8 bytes)
-    #   name bytes
-    #
-    # align8(8 + len) = (len + 15) & -8
-    lea r10, [rcx + 15]
-    and r10, -8
-
+    mov rcx, r9
+    
     # Payload begins after local-tail qword.
     lea r8, [rax + NODE_BODY + r10 + 8]
 
@@ -697,8 +751,9 @@ compile_ctrl_open:
 
 # rbp = parent scope node
 # r12 = parent physical compile end
-# rsi = child name
-# rdi = child code
+# rsi = name address
+# r9 = name length
+# rdi = child code pointer
 # returns:
 #  rax = unpublished child node
 #  r10 = parent's internal_skip patch cell
@@ -771,24 +826,23 @@ word_ctrl_open:
     jne fail_state
 
     call read_token
-    lea rsi, [rip + token_buf]
-
     call parse_declaration
     jc fail_token_invalid
 
-    # TODO: Until we decide what to do with parsed types
-    test rax, rax
-    jnz fail_token_invalid
+    call resolve_declaration_type
+    # rsi = name, rdx = type node or 0
 
     lea rdi, [rip + word_exec]
-
-    # alloc empty dictionary def
-    # keep dictionary tail unset until ctrl_close
+    # dict_add clobbers rdx
+    push rdx
     push r14
     call dict_add
-    mov rbp, rax
     pop r14
+    pop rdx
 
+    mov [rax + NODE_TYPE], rdx
+    mov rbp, rax
+    
     mov rax, rbp
     call node_payload
     mov r12, rax
@@ -802,25 +856,27 @@ word_ctrl_open:
 .ctrl_open_nested:
     # next token figures out : anonymous control region or scoped def
     call read_token
-    lea rsi, [rip + token_buf]
     call parse_declaration
     jc .ctrl_open_anonymous
 
-    # TODO: Types
-    test rax, rax
-    jnz fail_token_invalid
+    call resolve_declaration_type
+    # rsi = name, rdx = type node or 0
 
-    # skip patch ref and tagged parent
+    # reserve skip patch ref and tagged parent
     lea rcx, [rip + scope_stack_end]
-    lea rdx, [rbx + 16]
-    cmp rdx, rcx
+    lea rax, [rbx + 16]
+    cmp rax, rcx
     ja fail_stack_overflow
 
     lea rdi, [rip + word_exec]
+    push rdx
     call compile_child_declaration
+    pop rdx
 
-    # rax = child
-    # r10 = parent's skip patch 
+    # rax = child node
+    # r10 = parent's skip patch
+    mov [rax + NODE_TYPE], rdx
+
     mov [rbx], r10
     add rbx, 8
 
@@ -1032,7 +1088,6 @@ word_div:
 
 word_tick:
     call read_token
-    lea rsi, [rip + token_buf]
     call find_word
     jc fail_notfound
 
@@ -1148,7 +1203,6 @@ word_branch:
 
     # ? consumes one named word for arm
     call read_token
-    lea rsi, [rip + token_buf]
     call find_scope
     jc fail_notfound
 
@@ -1313,6 +1367,61 @@ word_type:
     mov r13, rax
     ret
 
+# [r12]   = scope node (context for a qualified ~ call) or 0 (use the current context)
+# [r12+8] = S, the statically-resolved member node (source of the member name and the
+#           no-context fallback)
+#
+# Qualified (scope != 0): establish the scope as the active context, run S, restore.
+# Plain (scope == 0): dispatch S by name from the innermost active context so that an
+#        inherited implementation resolves overridden members from the original context.
+#        With no active context it runs S directly (static behavior).
+word_member_dispatch:
+    mov rax, [r12]          # scope or 0
+    mov r11, [r12 + 8]      # S
+    add r12, 16
+
+    test rax, rax
+    jz .md_plain
+
+    # qualified member call: push context, run scope node, pop
+    lea rcx, [rip + scope_stack_end]
+    cmp rbx, rcx
+    jae fail_stack_overflow
+
+    or rax, SCOPE_CONTEXT_TAG
+    mov [rbx], rax
+    add rbx, 8
+
+    mov rax, r11             # word_exec takes the node to run in rax
+    mov rdx, [r11 + NODE_CODE]
+    call rdx
+
+    sub rbx, 8
+    ret
+
+.md_plain:
+    call scope_context
+    test rax, rax
+    jz .md_run_s
+
+    # name from the statically-resolved node
+    mov r10, rax            # context
+    mov rdx, r11            # scope
+    call node_name          # rax = name addr, rcx = name len
+    mov rsi, rax
+    mov r9, rcx
+    mov r8, r10
+    call find_scope_local
+    jnc .md_run             # override found in context's chain
+
+    # not found: fall back to the statically-resolved node
+.md_run_s:
+    mov rax, r11
+.md_run:
+    mov rdx, [rax + NODE_CODE]
+    call rdx
+    ret
+
 words_end:
 
 # rdx = node
@@ -1383,7 +1492,7 @@ scope_target:
     sub rcx, 8
     mov rax, [rcx]
 
-    test rax, SCOPE_TYPE_TAG
+    test rax, SCOPE_CONTEXT_TAG
     jz .scope_target_next
 
     and rax, -8
@@ -1393,14 +1502,16 @@ scope_target:
     stc
     ret
 
-# r8 = scope owning node
-# rsi = token
-# Search order: owner's dict, owner's type dict, type's type dict
-# Does not search parent scopes.
+# r8 = scope node
+# rsi = name address
+# r9 = name address
+# Search order: scope children, scope's type children, type chain
 # returns:
 #   rax = matching node
 #   CF = 0 found
 #   CF = 1 not found
+# clobbers:
+#   rax, rcx, rdx, r8, r10
 find_scope_local:
 .scope_local_next:
     mov rax, r8
@@ -1429,13 +1540,32 @@ find_scope_local:
     stc
     ret
 
-# rsi = null terminated token
-# Search order in STATE_DEF
-#   node dictionary
-#   node's type dictionary
-#   types' type dictionary
+# returns:
+#   rax = context node of the innermost active qualified member call, 0 if none
+scope_context:
+    mov rcx, rbx
+    lea rdx, [rip + scope_stack]
+
+.context_next:
+    cmp rcx, rdx
+    je .recv_missing
+    sub rcx, 8
+    mov rax, [rcx]
+
+    test rax, SCOPE_CONTEXT_TAG
+    jz .context_next
+
+    and rax, -8
+    ret
+.recv_missing:
+    xor rax, rax
+    ret
+
+# rsi = name address
+# r9 = name length
 # returns:
 #   rax = matching node
+#   r10 = 1 if context member, 0 if static
 #   CF = 0 found
 #   CF = 1 not found
 find_scope:
@@ -1443,12 +1573,13 @@ find_scope:
     jne .find_scope_root
 
     mov r11, rbx
+
+    # current word is static
     mov r8, rbp
-
-.find_scope_next:
     call find_scope_local
-    jnc .find_scope_done
+    jnc .find_scope_static
 
+# find immediate defining scope
 .find_scope_parent:
     lea rcx, [rip + scope_stack]
     cmp r11, rcx
@@ -1460,19 +1591,46 @@ find_scope:
     test rax, SCOPE_PARENT_TAG
     jz .find_scope_parent
 
-    # existing def boundary entry identifies the parent scope
-    and rax, -2
+    and rax, -8
     mov r8, rax
-    jmp .find_scope_next
 
+    # parent's scope is overrideable
+    call find_scope_local
+    jnc .find_scope_virtual
+
+    # anything further out is normal lookup
+.find_scope_outer:
+    lea rcx, [rip + scope_stack]
+    cmp r11, rcx
+    je .find_scope_root
+
+    sub r11, 8
+    mov rax, [r11]
+
+    test rax, SCOPE_PARENT_TAG
+    jz .find_scope_outer
+
+    and rax, -8
+    mov r8, rax
+
+    call find_scope_local
+    jc .find_scope_outer
+
+.find_scope_static:
+    mov r10d, 0
+    ret
+.find_scope_virtual:
+    mov r10d, 1
+    ret
 .find_scope_root:
     mov rdx, r14
-    jmp find_dict
-
-.find_scope_done:
+    call find_dict
+    # preserve CF from find_dict
+    mov r10d, 0
     ret
 
-# rsi = null-terminated token
+# rsi = name address
+# r9 = name length
 # returns:
 #   rax = matching node
 #   CF=0 found
@@ -1481,7 +1639,8 @@ find_word:
     mov rdx, r14
     jmp find_dict
 
-# rsi = null-terminated token
+# rsi = name address
+# r9 = name length
 # rdx = dictionary tail
 # Searches one dictionary chain
 # returns:
@@ -1489,51 +1648,39 @@ find_word:
 #   CF=0 found
 #   CF=1 not found
 find_dict:
-    # token length
-    xor r9d, r9d
-
-.find_token_len:
-    cmp byte ptr [rsi + r9], 0
-    je .find_token_len_done
-    inc r9
-    jmp .find_token_len
-
-.find_token_len_done:
-
-.find_next:
+.find_dict_next:
     test rdx, rdx
     jz .find_missing
 
-    # rax = candidate name address
-    # rcx = candidate name length
     call node_name
+    # rax = name
+    # rcx = name length
 
     cmp rcx, r9
-    jne .find_prev
+    jne .find_dict_prev
 
     xor r10d, r10d
 
-.find_compare:
+.find_dict_compare:
     cmp r10, r9
     je .find_found
 
     mov cl, byte ptr [rsi + r10]
     cmp cl, byte ptr [rax + r10]
-    jne .find_prev
+    jne .find_dict_prev
 
     inc r10
-    jmp .find_compare
+    jmp .find_dict_compare
 
-.find_prev:
+.find_dict_prev:
     mov rcx, [rdx + NODE_END]
     mov rdx, [rcx]
-    jmp .find_next
+    jmp .find_dict_next
 
 .find_found:
     mov rax, rdx
     clc
     ret
-
 .find_missing:
     stc
     ret
@@ -1543,26 +1690,37 @@ find_dict:
 # def + word => compile cell
 # def + lit => compile lit + value
 eval_token:
-    lea rsi, [rip + token_buf]
     call find_scope
     jnc .eval_word
 
     # then try scope~member
-    lea rsi, [rip + token_buf]
     call parse_member
     jc .eval_literal
 
+    # rax = context name
+    # r8 = context name len
+    # rsi = member name
+    # r9 = member name len
+
     push rsi
+    push r9
     mov rsi, rax
+    mov r9, r8
     call find_scope
+    pop r9
     pop rsi
     jc fail_notfound
 
-    # rax = scope node
-    # rsi = member string
+    # resolve member through context chain
     mov r8, rax
+    push r8
     call find_scope_local
+    pop r8
     jc fail_notfound
+
+    # rax = resolved member
+    # r8 = original context node
+    jmp .eval_qualified
 
 .eval_word:
     mov rdx, [rax + NODE_CODE]
@@ -1573,9 +1731,54 @@ eval_token:
     test qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
     jnz .eval_exec
 
-    # any other word: compile
+    # r10 = 1 means it was resolved with override
+    test r10, r10
+    jnz .eval_compile_static
+
+    # Resolve member from context if one exists
+    lea rdx, [rip + internal_member_dispatch]
+    mov [r12], rdx
+    mov qword ptr [r12 + 8], 0
+    mov [r12 + 16], rax
+    add r12, 24
+    ret
+
+.eval_compile_static:
     mov [r12], rax
     add r12, 8
+    ret
+
+.eval_qualified:
+    # rax = member node
+    # r8 = scope node
+    cmp qword ptr [rip + state], STATE_EXE
+    je .eval_qualified_exec
+
+    test qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
+    jnz .eval_qualified_exec
+
+    # def: compile a qualified member call
+    lea rdx, [rip + internal_member_dispatch]
+    mov [r12], rdx
+    mov [r12 + 8], r8
+    mov [r12 + 16], rax
+    add r12, 24
+    ret
+
+.eval_qualified_exec:
+    # EXE: establish x as the active context, run scope node, restore
+    lea rcx, [rip + scope_stack_end]
+    cmp rbx, rcx
+    jae fail_stack_overflow
+
+    or r8, SCOPE_CONTEXT_TAG
+    mov [rbx], r8
+    add rbx, 8
+
+    mov rdx, [rax + NODE_CODE]
+    call rdx
+
+    sub rbx, 8
     ret
 
 .eval_exec:
@@ -1587,7 +1790,6 @@ eval_token:
     je .def_literal
 
     # exe: parse and push literal
-    lea rsi, [rip + token_buf]
     call parse_literal
     jc fail_notfound
 
@@ -1597,29 +1799,24 @@ eval_token:
     ret
 
 .eval_declaration:
-    lea rsi, [rip + token_buf]
     call parse_declaration
     jc fail_notfound
 
+    # declaration must be typed
     test rax, rax
     jz fail_token_invalid
 
-    # rax = type string
-    # rsi = declaration name
-    push rsi
-    mov rsi, rax
-    call find_scope
-    pop rsi
-    jc fail_notfound
+    call resolve_declaration_type
+    # rdx = type node
+    # rsi/r9 = declaration name
 
-    push rax
+    push rdx
     push rbp
 
     lea rdi, [rip + word_exec]
     call compile_child_declaration
 
-    # rax = target child
-    # target.NODE_TYPE = type
+    # stack: parent, +8 type
     mov rcx, [rsp + 8]
     mov [rax + NODE_TYPE], rcx
 
@@ -1628,7 +1825,6 @@ eval_token:
 
     # child is now phisical compilation context
     mov rbp, rax
-    mov rax, rbp
     call node_payload
     mov r12, rax
 
@@ -1638,7 +1834,7 @@ eval_token:
     jae fail_stack_overflow
 
     mov rax, rbp
-    or rax, SCOPE_TYPE_TAG
+    or rax, SCOPE_CONTEXT_TAG
     mov [rbx], rax
     add rbx, 8
 
@@ -1651,7 +1847,7 @@ eval_token:
     mov rdx, [rax + NODE_CODE]
     call rdx
 
-    # constructor should leav scope balanced
+    # constructor should leave scope balanced
     sub rbx, 8
 
     # restore child publication context (no longer target scope)
@@ -1664,7 +1860,6 @@ eval_token:
     ret
 
 .def_literal:
-    lea rsi, [rip + token_buf]
     call parse_literal
     jc .eval_declaration
 
@@ -1690,95 +1885,95 @@ _start:
     # global
     lea rsi, [rip + token_dup]
     lea rdi, [rip + word_dup]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_drop]
     lea rdi, [rip + word_drop]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_swap]
     lea rdi, [rip + word_swap]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_over]
     lea rdi, [rip + word_over]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_add]
     lea rdi, [rip + word_add]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_sub]
     lea rdi, [rip + word_sub]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_mul]
     lea rdi, [rip + word_mul]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_div]
     lea rdi, [rip + word_div]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_write]
     lea rdi, [rip + word_write]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_tick]
     lea rdi, [rip + word_tick]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_sys]
     lea rdi, [rip + word_sys]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_store]
     lea rdi, [rip + word_store]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_load]
     lea rdi, [rip + word_load]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_mask_and]
     lea rdi, [rip + word_mask_and]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_mask_or]
     lea rdi, [rip + word_mask_or]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_eq]
     lea rdi, [rip + word_eq]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_lt]
     lea rdi, [rip + word_lt]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_shl]
     lea rdi, [rip + word_shl]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_shr]
     lea rdi, [rip + word_shr]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_loop]
     lea rdi, [rip + word_loop]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_break]
     lea rdi, [rip + word_break]
-    call dict_add
+    call dict_add_z
     lea rsi, [rip + token_type]
     lea rdi, [rip + word_type]
-    call dict_add
+    call dict_add_z
 
     # immediates
     lea rsi, [rip + token_ctrl_open]
     lea rdi, [rip + word_ctrl_open]
-    call dict_add
+    call dict_add_z
     or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
     lea rsi, [rip + token_ctrl_close]
     lea rdi, [rip + word_ctrl_close]
-    call dict_add
+    call dict_add_z
     or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
     lea rsi, [rip + token_branch]
     lea rdi, [rip + word_branch]
-    call dict_add
+    call dict_add_z
     or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
     lea rsi, [rip + token_immediate]
     lea rdi, [rip + word_immediate]
-    call dict_add
+    call dict_add_z
     or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
     lea rsi, [rip + token_asm]
     lea rdi, [rip + word_asm]
-    call dict_add
+    call dict_add_z
     or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
     # load embedded bootstrap code
