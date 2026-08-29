@@ -22,12 +22,9 @@
 
 # Max depth of scope stack depth
 .equ SCOPE_MAX, 64
-# compile-time scope stack tags
-# all real pointers stored here are 8 byte aligned
-# pointer = enclosing scope owner, used for nested definition return / lookups
 .equ SCOPE_PARENT_TAG, 1
-# pointer = dynamic accessor / closure environment, used by constructors, or jump to member calls and inherited member dispatch
 .equ SCOPE_CONTEXT_TAG, 2
+.equ SCOPE_COMPILE_TAG, 4
 .equ SCOPE_TAG_MASK, 7
 
 .equ E_EOF, -1
@@ -95,6 +92,8 @@ token_asm:
     .asciz "asm"
 token_type:
     .asciz "type"
+token_lit:
+    .asciz "lit"
 
 err_unknown:
     .asciz "Unknown error occurred\n"
@@ -137,10 +136,6 @@ internal_native:
 internal_member_dispatch:
     .quad word_member_dispatch
 
-bootstrap:
-    .incbin "src/bootstrap.ht"
-bootstrap_end:
-
 .section .bss
 
 .align 8
@@ -163,11 +158,6 @@ data_stack:
     .skip 65536
 data_stack_end:
 
-input_ptr:
-    .quad 0
-input_end:
-    .quad 0
-
 .align 16
 dict:
     .skip 131072
@@ -186,20 +176,6 @@ native_here:
 
 read_char:
     push rcx
-
-    # Embedded bootstrap input first.
-    mov rcx, qword ptr [rip + input_ptr]
-    cmp rcx, qword ptr [rip + input_end]
-    jae .read_char_stdin
-
-    movzx eax, byte ptr [rcx]
-    inc rcx
-    mov qword ptr [rip + input_ptr], rcx
-
-    pop rcx
-    ret
-
-.read_char_stdin:
     mov eax, 0                    # SYS_read
     xor edi, edi                  # stdin
     lea rsi, [rip + io_char]
@@ -451,6 +427,10 @@ read_token:
     je .skip_ws
     cmp al, byte ptr [rip + token_ign]
     je .skip_comment
+
+    # quote belongs to the next word, do not consume next
+    cmp al, '"'
+    je .single
     jmp .next
 
 .skip_comment:
@@ -460,6 +440,13 @@ read_token:
     cmp al, '\n'
     jne .skip_comment
     jmp .skip_ws
+
+.single:
+    mov byte ptr [rip + token_buf], al
+    lea rsi, [rip + token_buf]
+    mov r9d, 1
+    xor eax, eax
+    ret
 
 .next:
     cmp rcx, TOKEN_MAX_LEN
@@ -478,8 +465,8 @@ read_token:
     je .done
     cmp al, '\n'
     je .done
-
     jmp .next
+
 .done:
     lea rsi, [rip + token_buf]
     mov r9, rcx
@@ -987,17 +974,42 @@ word_exec:
     push r12
     push rbx
 
-    mov rbp, rax
+    # did this invocation establish the compile target?
+    push 0
 
+    # if compile-time code in definition, preserve the definition being defined
+    cmp qword ptr [rip + state], STATE_DEF
+    jne .exec_target_ready
+
+    # nested calls from an immediate reuses the existing target
+    mov r10, rax
+    call scope_compile_target
+    mov rax, r10
+    jnc .exec_target_ready
+
+    # rbp = definition being compiled
+    # no target, save current r12 compile cursor
+    mov [rbp + NODE_END], r12
+
+    lea rcx, [rip + scope_stack_end]
+    cmp rbx, rcx
+    jae fail_stack_overflow
+
+    mov rdx, rbp
+    or rdx, SCOPE_COMPILE_TAG
+    mov [rbx], rdx
+    add rbx, 8
+
+    mov qword ptr [rsp], 1
+.exec_target_ready:
+    mov rbp, rax
     # r12 = start of node payload
     call node_payload
     mov r12, rax
 
-    # Root payload currently begins:
-    #   +8  packed root start|end
+    # root payload + 8 = start|end
     mov rax, [r12 + 8]
     shr rax, 32
-
     lea rcx, [rbp + NODE_BODY]
     lea rax, [rcx + rax]
     push rax
@@ -1013,6 +1025,18 @@ word_exec:
     jmp .exec_next
 
 .exec_done:
+    # discard execution end
+    add rsp, 8
+    # if compile target modified NODE_END for compile time emission
+    cmp qword ptr [rsp], 0
+    je .exec_restore
+
+    # stack: rsp + 24 = saved rbp compile target
+    mov rax, [rsp + 24]
+    mov rax, [rax + NODE_END]
+    mov [rsp + 16], rax
+
+.exec_restore:
     add rsp, 8
     pop rbx
     pop r12
@@ -1105,6 +1129,26 @@ word_lit:
     mov [r15], r13
     add r15, 8
     mov r13, rax
+    ret
+
+# Waaaait, why lit and compile_lit?
+# Emits TOS as a runtime literal into the active compile target (word)
+word_compile_lit:
+    call scope_compile_target
+    jc fail_state
+
+    # rax = definition being compiled
+    mov rcx, [rax + NODE_END]
+    lea rdx, [rip + internal_lit]
+    mov [rcx], rdx
+    mov [rcx + 8], r13
+    add rcx, 16
+
+    # advance stored compile cursor
+    mov [rax + NODE_END], rcx
+
+    sub r15, 8
+    mov r13, [r15]
     ret
 
 # [r12] = native entry address
@@ -1561,6 +1605,31 @@ scope_context:
     xor rax, rax
     ret
 
+# returns:
+#   rax = node currently receiving compile time output
+#   CF = 0 found
+#   CF = 1 not found
+scope_compile_target:
+    mov rcx, rbx
+    lea rdx, [rip + scope_stack]
+.compile_target_next:
+    cmp rcx, rdx
+    je .compile_target_missing
+    sub rcx, 8
+    mov rax, [rcx]
+
+    test rax, SCOPE_COMPILE_TAG
+    jz .compile_target_next
+
+    and rax, -8
+    clc
+    ret
+.compile_target_missing:
+    stc
+    ret
+
+    ret
+
 # rsi = name address
 # r9 = name length
 # returns:
@@ -1949,6 +2018,9 @@ _start:
     lea rsi, [rip + token_type]
     lea rdi, [rip + word_type]
     call dict_add_z
+    lea rsi, [rip + token_lit]
+    lea rdi, [rip + word_compile_lit]
+    call dict_add_z
 
     # immediates
     lea rsi, [rip + token_ctrl_open]
@@ -1976,15 +2048,9 @@ _start:
     call dict_add_z
     or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
-    # load embedded bootstrap code
-    lea rax, [rip + bootstrap]
-    mov [rip + input_ptr], rax
-
-    lea rax, [rip + bootstrap_end]
-    mov [rip + input_end], rax
-
 .repl_loop:
     call read_token
+    # rax = return, can be EOF, but handy for bootstrapping and continuing repl
     call eval_token
     jmp .repl_loop
 
