@@ -22,10 +22,14 @@
 
 # Max depth of scope stack depth
 .equ SCOPE_MAX, 64
-.equ SCOPE_PARENT_TAG, 1
-.equ SCOPE_CONTEXT_TAG, 2
-.equ SCOPE_COMPILE_TAG, 4
+
 .equ SCOPE_TAG_MASK, 7
+# Enclosing definition (outside of [)
+.equ SCOPE_PARENT_TAG, 1
+# Active ~ receiver / accessor context
+.equ SCOPE_CONTEXT_TAG, 2
+# Active definition receiving emitted code
+.equ SCOPE_COMPILE_TAG, 4
 
 .equ E_EOF, -1
 .equ E_LEN, -2
@@ -1159,21 +1163,15 @@ word_native:
     jmp rax 
 
 # [r12] = packed control frame
-# CF=0 success
-# CF=1 stack full
 word_ctrl_push:
     lea rcx, [rip + scope_stack_end]
     cmp rbx, rcx
-    jae .ctrl_push_full
+    jae fail_stack_overflow
 
     mov rax, [r12]
     add r12, 8
     mov [rbx], rax
     add rbx, 8
-    clc
-    ret
-.ctrl_push_full:
-    stc
     ret
 
 # RAX = popped packed control frame
@@ -1802,7 +1800,7 @@ eval_token:
 
     # r10 = 1 means it was resolved with override
     test r10, r10
-    jnz .eval_compile_static
+    jz .eval_compile_static
 
     # Resolve member from context if one exists
     lea rdx, [rip + internal_member_dispatch]

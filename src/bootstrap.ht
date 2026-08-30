@@ -40,10 +40,147 @@
     sys
 ]
 
+# mmap: length -> result
+# Linux syscall 9
+[ :mmap
+    $2 !        # length, consume from stack
+    9 $0 !      # SYS_MMAP
+    0 $1 !      # addr = null
+    3 $3 !      # PROT_READ | PROT_WRITE
+    34 $4 !     # MAP_PRIVATE | MAP_ANONYMOUS
+    -1 $5 !     # fd
+    0 $6 !      # offset
+    sys
+    $0 @        # return value
+]
+
+[ :nop ]
+
+# arena allocator
+[ :arena
+    [ :ptr
+        [ :init
+            [ :mmap-err
+                -1
+                exit
+            ]
+            1048576 mmap
+            [
+                ^ 0 < ? mmap-err
+            ]
+
+            # [base + 0] = base + 16
+            ^ 16 + <^ !
+
+            # [base + 8] = base + 1048576
+            ^ 1048576 + <^ 8 + !
+
+            lit
+            immediate
+        ]
+        init
+    ]
+    [ :cursor
+        ptr @
+    ]
+    [ :seek
+        ptr !
+    ]
+    [ :end
+        ptr 8 + @
+    ]
+    [ :len
+        end ptr -
+    ]
+    [ :remaining
+        end cursor -
+    ]
+    [ :used
+        ptr 16 +
+        cursor ptr 16 + -
+    ]
+    [ :span
+        ptr 16 +
+        used
+    ]
+    [ :alloc
+        [ :overflow
+            1 exit
+        ]
+        cursor ><
+
+        # preserve cursor and increment
+        <^ +
+
+        # if > end, fail
+        [
+            ^ end >< < ? overflow
+        ]
+
+        # store next as new cursor, discard it
+        # leaves old cursor as allocation result
+        ^ seek _
+    ]
+]
+
 # standard types
 [ :u8
     [ :@
         [ 0x4d 0x0f 0xb6 0x6d 0x00 asm ]
+    ]
+    [ :read
+        [ :abort 1 exit ]
+
+        ^ # keep ptr
+        0 >< # fd buf
+        1 # count 
+        read
+        1 = 0 = ? abort
+    ]
+]
+
+# String literals
+[ :"
+    [ :overflow 1 exit ]
+    [ :done
+        <^ -
+        # ptr len
+        >< lit lit
+    ]
+
+    arena~cursor
+    [
+        arena~cursor
+        ^ arena~end < 0 = ? overflow
+
+        u8~read
+
+        ^ u8~@
+        34 = ? done
+        _
+
+        arena~cursor 1 +
+        arena~seek
+
+        ~[
+    ]
+    immediate
+]
+
+[ :memory
+    [ :ptr ]
+    [ :len ]
+    [ :span ptr len ]
+]
+
+# str is a printable memory span (ie. the string type)
+[ memory:str
+    [ :.
+        [ :write-err 1 exit ]
+        1 # stdout
+        span
+        write
+        0 < ? write-err
     ]
 ]
 
