@@ -1,11 +1,14 @@
 # Dedicated register association
-# rbp = current dict word / execution frame
+# rbp = current definition
 # rbx = scope stack pointer
-# r12 = threaded instruction pointer
-# r13 = TOS
+# r12 = threaded instruction pointer / compile cursor
+# r13 = cached TOS
 # r14 = dictionary tail
 # r15 = data stack pointer
 .intel_syntax noprefix
+
+.equ DICT_SIZE, 131072
+.equ DICT_QWORDS, DICT_SIZE / 8
 
 .equ STATE_EXE, 0
 .equ STATE_DEF, 1
@@ -164,7 +167,7 @@ data_stack_end:
 
 .align 16
 dict:
-    .skip 131072
+    .skip DICT_SIZE
 dict_end:
 
 .section .native,"awx",@progbits
@@ -351,6 +354,64 @@ parse_hex_byte:
     clc
     ret
 .hex_invalid:
+    stc
+    ret
+
+
+# rsi = token address
+# r9 = token length
+# returns:
+#  rax = scope address
+#  r8 = scope length
+#  rsi = member address
+#  r9 = member length
+#  CF = 0 valid
+#  CF = 1 invalid
+parse_member:
+    xor ecx, ecx
+
+.member_scan:
+    cmp rcx, r9
+    je .member_invalid
+
+    cmp byte ptr [rsi + rcx], '~'
+    je .member_split
+
+    inc rcx
+    jmp .member_scan
+
+.member_split:
+    # scope non-empty
+    test rcx, rcx
+    je .member_invalid
+    # member must not be empty
+    lea rdx, [rcx + 1]
+    cmp rdx, r9
+    je .member_invalid
+
+    # preserve scope length
+    mov r8, rcx
+    mov rcx, rdx
+
+.member_tail:
+    cmp rcx, r9
+    jz .member_done
+
+    # TODO: only one scope member jump for now
+    cmp byte ptr [rsi + rcx], '~'
+    je .member_invalid
+
+    inc rcx
+    jmp .member_tail
+    
+.member_done:
+    mov rax, rsi
+    lea rsi, [rsi + r8 + 1]
+    sub r9, r8
+    dec r9
+    clc
+    ret
+.member_invalid:
     stc
     ret
 
@@ -551,62 +612,6 @@ resolve_declaration_type:
 .resolve_decl_done:
     ret
 
-# rsi = token address
-# r9 = token length
-# returns:
-#  rax = scope address
-#  r8 = scope length
-#  rsi = member address
-#  r9 = member length
-#  CF = 0 valid
-#  CF = 1 invalid
-parse_member:
-    xor ecx, ecx
-
-.member_scan:
-    cmp rcx, r9
-    je .member_invalid
-
-    cmp byte ptr [rsi + rcx], '~'
-    je .member_split
-
-    inc rcx
-    jmp .member_scan
-
-.member_split:
-    # scope non-empty
-    test rcx, rcx
-    je .member_invalid
-    # member must not be empty
-    lea rdx, [rcx + 1]
-    cmp rdx, r9
-    je .member_invalid
-
-    # preserve scope length
-    mov r8, rcx
-    mov rcx, rdx
-
-.member_tail:
-    cmp rcx, r9
-    jz .member_done
-
-    # TODO: only one scope member jump for now
-    cmp byte ptr [rsi + rcx], '~'
-    je .member_invalid
-
-    inc rcx
-    jmp .member_tail
-    
-.member_done:
-    mov rax, rsi
-    lea rsi, [rsi + r8 + 1]
-    sub r9, r8
-    dec r9
-    clc
-    ret
-.member_invalid:
-    stc
-    ret
     
 # rsi = name address
 # r9 = name length
@@ -657,6 +662,10 @@ dict_add_z:
 node_add:
     mov rax, r8
     mov rcx, r9
+
+    # align end of name + descriptor
+    lea r10, [rcx + 15]
+    and r10, -8
     
     # Payload begins after local-tail qword.
     lea r8, [rax + NODE_BODY + r10 + 8]
@@ -696,10 +705,6 @@ node_add:
     jmp .node_name_copy
 
 .node_name_done:
-    # Recompute aligned name end.
-    lea r10, [rcx + 15]
-    and r10, -8
-
     # New node begins with an empty local dictionary.
     mov qword ptr [rax + NODE_BODY + r10], 0
 
@@ -804,6 +809,258 @@ compile_child_publish:
     mov rbp, r9
     ret
 
+.macro SIGNATURE_POSITION_COUNT dst, tmp, header
+    mov \dst, [\header]
+    mov \tmp, \dst
+    and \dst, 0xf # input count
+    shr \tmp, 4
+    and \tmp, 0xf # output count
+    add \dst, \tmp
+.endm
+.macro SIGNATURE_LOCAL_COUNT dst, header
+    mov \dst, [\header]
+    shr \dst, 8
+    and \dst, 0xf
+.endm
+.macro NODE_NAME_ALIGNED_SIZE dst, node
+    mov \dst, [\node + NODE_BODY]
+    shr \dst, 32
+    add \dst, 7
+    and \dst, -8
+.endm
+
+# rax = signature header address
+# rdx = local slot 0..7
+signature_append_ref:
+    SIGNATURE_POSITION_COUNT rcx, r8, rax
+    cmp rcx, 8
+    jae fail_token_invalid
+
+    # refs start at 12, each 3 bits
+    lea ecx, [rcx + rcx * 2 + 12]
+    shl rdx, cl
+    or [rax], rdx
+    ret
+
+# rax = signature header
+# fails if all slots used
+signature_require_position:
+    SIGNATURE_POSITION_COUNT rcx, r8, rax
+    cmp rcx, 8
+    jae fail_token_invalid
+    ret
+
+# rsi/r9 = local name
+# rdx = type node or 0
+# rdi = header count delta: 0x101 = input & local count, 0x110 output + local count
+# returns:
+#   r10 = allocated slot
+signature_declare_local:
+    push rdi
+    push rdx
+    # check duplicate
+    call find_current_local
+    pop rdx
+    jnc fail_token_invalid
+
+    NODE_NAME_ALIGNED_SIZE rcx, rbp
+    lea rax, [rbp + NODE_BODY + rcx + 8]
+
+    call signature_require_position
+    SIGNATURE_LOCAL_COUNT r10, rax
+
+    push r10
+    call compile_local
+    pop r10
+
+    NODE_NAME_ALIGNED_SIZE rcx, rbp
+    lea rax, [rbp + NODE_BODY + rcx + 8]
+
+    mov rdx, r10
+    call signature_append_ref
+
+    pop rdi
+    add qword ptr [rax], rdi
+    ret
+
+# r10 = existing local slot
+# rdi = address of parser output slot mask
+signature_reuse_output:
+    NODE_NAME_ALIGNED_SIZE rcx, rbp
+    lea rax, [rbp + NODE_BODY + rcx + 8]
+
+    call signature_require_position
+
+    bt qword ptr [rdi], r10
+    jc fail_token_invalid
+    bts qword ptr [rdi], r10
+
+    mov rdx, r10
+    call signature_append_ref
+    add qword ptr [rax], 0x10 # output only (already defined)
+    ret
+
+# rbp = def
+# r12 = first free qword after signature header
+# '(' already consumed
+# returns:
+#   r12 = first free qword after local definitions in signature header
+compile_signature:
+    push 0 # parser output slot mask
+
+.signature_inputs:
+    call read_token
+    # '--' switch to outputs
+    cmp r9, 2
+    jne .signature_input
+    cmp word ptr [rsi], 0x2d2d
+    je .signature_outputs
+
+.signature_input:
+    # must declare new local
+    call parse_declaration
+    jc fail_token_invalid
+
+    call resolve_declaration_type
+
+    mov edi, 0x101
+    call signature_declare_local
+    jmp .signature_inputs
+
+.signature_outputs:
+    call read_token
+    # ')' ends signature
+    cmp r9, 1
+    jne .signature_output
+    cmp byte ptr [rsi], ')'
+    je .signature_done
+
+.signature_output:
+    # new declaration: create output local
+    # else: reuse existing
+    call parse_declaration
+    jc .signature_output_reuse
+
+    call resolve_declaration_type
+
+    mov edi, 0x110
+    call signature_declare_local
+
+    # a new output local cannot already exist
+    # later refs to this must be rejected
+    bts qword ptr [rsp], r10
+    jmp .signature_outputs
+
+.signature_output_reuse:
+    call find_current_local
+    jc fail_notfound
+
+    call node_local_binding
+    mov r10, rax
+    and r10d, 7
+    
+    lea rdi, [rsp]
+    call signature_reuse_output
+    jmp .signature_outputs
+
+.signature_done:
+    add rsp, 8
+    ret
+
+# rbp = newly-created word_exec definition
+# r12 = first free qword after zeroed signature header
+# STATE_DEF is active
+compile_definition_open:
+    call read_token
+
+    # Optional signature starts with '('.
+    cmp r9, 1
+    jne .definition_body
+    cmp byte ptr [rsi], '('
+    jne .definition_body
+
+    call compile_signature
+
+    # Signature parser consumed ')'.
+    # Code begins after all local definitions.
+    mov rax, rbp
+    call node_exec_set_code_start
+    call compile_ctrl_open
+    ret
+
+.definition_body:
+    # No signature. We consumed the first body token,
+    # so establish executable start/control then evaluate it.
+    mov rax, rbp
+    call node_exec_set_code_start
+    call compile_ctrl_open
+    call eval_token
+    ret
+
+# rbp = owning node
+# r12 = next free physical qword
+# rsi = local name
+# r9 = local name len
+# rdx = declared type node, or 0 for anonymous
+# r10 = local slot 0..7
+# returns:
+#   rax = published signature local node
+#   r12 = next free qword after local node
+compile_local:
+    # node_add needs rdx for the previous local node.
+    push rdx
+    push r10
+
+    # push parent local dictionary tail
+    mov rax, rbp
+    call node_locals_ref
+    push rax
+
+    mov rdx, [rax]
+    mov r8, r12
+    lea rdi, [rip + word_local]
+    call node_add
+
+    # +16 = type
+    mov rcx, [rsp + 16]
+    mov [rax + NODE_TYPE], rcx
+
+    # node_add leaves NODE_END at payload start
+    # overwrite previous node cell with: parent pointer | slot
+    mov rcx, [rax + NODE_END]
+    mov r11, rbp
+    or r11, [rsp + 8] # slot
+    mov [rcx], r11
+
+    # node_add's prev-node cell is overwritten => local binding
+    # node_finalize will add one back later
+    mov rcx, [rax + NODE_END]
+    mov r11, rbp
+    or r11, [rsp + 8]
+    mov [rcx], r11
+
+    # local payload
+    mov r9, rbp
+    mov rbp, rax
+    lea r12, [rcx + 8]
+
+    mov rcx, [rsp] # parent local tail cell
+    mov rdx, [rcx]
+    call node_finalize
+
+    mov rbp, r9
+
+    # publish to local node dictionary
+    mov rcx, [rsp]
+    mov [rcx], rax
+    add r12, 8 # prev-node from finalize is [r12]
+    add rsp, 24
+
+    # note that we don't use internal_skip here:
+    # signature locals are before code_start
+    # no skip needed.
+    ret
+
 words:
 
 word_ctrl_open:
@@ -834,11 +1091,11 @@ word_ctrl_open:
     mov [rax + NODE_TYPE], rdx
     mov rbp, rax
     
-    mov rax, rbp
-    call node_payload
-    mov r12, rax
+    call node_exec_header_init
 
     mov qword ptr [rip + state], STATE_DEF
+
+    call compile_definition_open
 
     call compile_ctrl_open
     ret
@@ -878,10 +1135,9 @@ word_ctrl_open:
 
     # compile into child
     mov rbp, rax
-    call node_payload
-    mov r12, rax
 
-    call compile_ctrl_open
+    call node_exec_header_init
+    call compile_definition_open
     ret
 .ctrl_open_anonymous:
     call compile_ctrl_open
@@ -977,7 +1233,6 @@ word_exec:
     push rbp
     push r12
     push rbx
-
     # did this invocation establish the compile target?
     push 0
 
@@ -1007,19 +1262,10 @@ word_exec:
     mov qword ptr [rsp], 1
 .exec_target_ready:
     mov rbp, rax
-    # r12 = start of node payload
-    call node_payload
-    mov r12, rax
-
-    # root payload + 8 = start|end
-    mov rax, [r12 + 8]
-    shr rax, 32
-    lea rcx, [rbp + NODE_BODY]
-    lea rax, [rcx + rax]
-    push rax
+    call node_exec_start
 
 .exec_next:
-    cmp r12, [rsp]
+    cmp r12, [rbp + NODE_END]
     je .exec_done
 
     mov rax, [r12]
@@ -1029,8 +1275,6 @@ word_exec:
     jmp .exec_next
 
 .exec_done:
-    # discard execution end
-    add rsp, 8
     # if compile target modified NODE_END for compile time emission
     cmp qword ptr [rsp], 0
     je .exec_restore
@@ -1277,7 +1521,6 @@ word_branch_runtime:
     mov rax, r8
     mov rdx, [rax + NODE_CODE]
     call rdx
-
 .branch_runtime_done:
     ret
     
@@ -1464,6 +1707,9 @@ word_member_dispatch:
     call rdx
     ret
 
+word_local:
+    jmp fail_state
+
 words_end:
 
 # rdx = node
@@ -1481,27 +1727,69 @@ node_name:
     lea rax, [rdx + NODE_BODY + rax]
     ret
 
-node_payload:
-    mov rcx, [rax + NODE_BODY]
-    shr rcx, 32
-    add rcx, 7
-    and rcx, -8
+# rax = created word_exec node
+# returns:
+#  r12 = first free qword after signature header
+node_exec_header_init:
+    NODE_NAME_ALIGNED_SIZE rcx, rax
 
-    # Skip local-tail qword.
-    lea rax, [rax + NODE_BODY + rcx + 8]
+    # node_add places a temporary previous node pointer here
+    # node_finalize will re-write it at the finalize step
+    lea r12, [rax + NODE_BODY + rcx + 8]
+    mov qword ptr [r12], 0
+    add r12, 8
+    ret
+
+# rax = word_exec node
+# r12 = first executable threaded qword
+node_exec_set_code_start:
+    NODE_NAME_ALIGNED_SIZE rcx, rax
+
+    # rcx = signature header
+    lea rcx, [rax + NODE_BODY + rcx + 8]
+
+    # 36..49 = start offset in qwords from NODE_BODY
+    mov rdx, r12
+    lea r11, [rax + NODE_BODY]
+    sub rdx, r11
+    shr rdx, 3
+
+    cmp rdx, DICT_QWORDS - 1
+    ja fail_dict_overflow
+
+    shl rdx, 36
+    or [rcx], rdx
+    ret
+
+# rax = word_exec node
+# returns:
+#  r12 = first threaded instruction in code payload
+node_exec_start:
+    NODE_NAME_ALIGNED_SIZE rcx, rax
+
+    # word_exec payload begins with signature header
+    mov rdx, [rax + NODE_BODY + rcx + 8]
+
+    shr rdx, 36
+    and edx, DICT_QWORDS - 1
+    lea rcx, [rax + NODE_BODY]
+    lea r12, [rcx + rdx * 8]
     ret
 
 # rax = node
 # returns:
 #   rax = address of node-local dictionary tail cell
 node_locals_ref:
-    mov rcx, [rax + NODE_BODY]
-    shr rcx, 32
-    add rcx, 7
-    and rcx, -8
-
-    # Local-tail qword is immediately after aligned name.
+    NODE_NAME_ALIGNED_SIZE rcx, rax
     lea rax, [rax + NODE_BODY + rcx]
+    ret
+
+# rax = signature local node
+# returns:
+#  rax = packed owner | slot (0..7)
+node_local_binding:
+    NODE_NAME_ALIGNED_SIZE rcx, rax
+    mov rax, [rax + NODE_BODY + rcx + 8]
     ret
 
 # rax = node
@@ -1581,6 +1869,20 @@ find_scope_local:
 .scope_local_missing:
     stc
     ret
+
+# rbp = parent to local definition
+# rsi = name
+# r9 = name len
+# returns:
+#   rax = matching direct local def
+#   CF = 0 found
+#   CF = 1 not found
+# NOTE: Purposely does not look outside defining parent
+find_current_local:
+    mov rax, rbp
+    call node_locals_ref
+    mov rdx, [rax]
+    jmp find_dict
 
 # returns:
 #   rax = context node of the innermost active qualified member call, 0 if none
@@ -1890,10 +2192,11 @@ eval_token:
     # r10 = parent skip patch
     push r10
 
-    # child is now phisical compilation context
+    # child is now physical compilation context
     mov rbp, rax
-    call node_payload
-    mov r12, rax
+
+    call node_exec_header_init
+    call compile_definition_open
 
     # push constructor target
     lea rcx, [rip + scope_stack_end]
