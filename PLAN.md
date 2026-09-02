@@ -524,32 +524,32 @@ The intended permanent kernel ABI remains small:
 
 ## 10. Implementation sequence
 
-### Step 1 — Baseline execution refactor
+### Step 1 — Baseline execution refactor - DONE
 
-- fix unrelated assembler/test-harness blockers;
-- make `word_exec` use `NODE_END` directly as its execution boundary;
-- preserve current `~[` / `~]` behavior;
-- regression-test controls, constructors, immediate execution, member dispatch, `lit`, and `asm`;
-- document or name the native-stack layout used by `word_exec` rather than adding more ad-hoc offsets.
+X fix unrelated assembler/test-harness blockers;
+X make `word_exec` use `NODE_END` directly as its execution boundary;
+X preserve current `~[` / `~]` behavior;
+X regression-test controls, constructors, immediate execution, member dispatch, `lit`, and `asm`;
+X document or name the native-stack layout used by `word_exec` rather than adding more ad-hoc offsets.
 
 ### Step 2 — New `word_exec` payload ABI
 
-- reserve the header qword for every `word_exec` node;
-- transition bracket definitions and constructor-created executable nodes directly;
-- add counts, ordered 3-bit refs, and executable-start qword offset.
+X reserve the header qword for every `word_exec` node;
+X transition bracket definitions and constructor-created executable nodes directly;
+X add counts, ordered 3-bit refs, and executable-start qword offset.
 
 ### Step 3 — Signature locals and parser
 
-- create signature-local child nodes;
-- allocate dense slots;
-- enforce duplicate/position limits;
-- make local resolution lexical before receiver/member behavior.
+X create signature-local child nodes;
+X allocate dense slots;
+X enforce duplicate/position limits;
+X make local resolution lexical before receiver/member behavior.
 
 ### Step 4 — Active invocation scope entry
 
-- add bit63-marked packed invocation entries without changing existing scope encodings;
-- add encode/decode and owner-lookup helpers;
-- construct invocation frames using `caller_cursor`, `local_base`, and `temporary_floor`.
+X add bit63-marked packed invocation entries without changing existing scope encodings;
+X add encode/decode and owner-lookup helpers;
+X construct invocation frames using `caller_cursor`, `local_base`, and `temporary_floor`.
 
 ### Step 5 — Local reads
 

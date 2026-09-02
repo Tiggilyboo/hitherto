@@ -126,6 +126,10 @@ err_dict_overflow:
     .asciz "Dictionary full\n"
 err_state:
     .asciz "Already in define state\n"
+err_compile_node:
+    .asciz "Node not consumed at compile time tried to execute at runtime\n"
+err_state_local:
+    .asciz "Invalid local state\n"
 
 .align 8
 internal_lit:
@@ -142,6 +146,8 @@ internal_native:
     .quad word_native
 internal_member_dispatch:
     .quad word_member_dispatch
+internal_local_get:
+    .quad word_local_get
 
 .section .bss
 
@@ -858,10 +864,16 @@ signature_require_position:
 signature_declare_local:
     push rdi
     push rdx
-    # check duplicate
-    call find_current_local
+    # validate: may override words but not other locals
+    call find_scope
+    jc .signature_local_free
+
+    lea rcx, [rip + word_local]
+    cmp [rax + NODE_CODE], rcx
+    je fail_token_invalid
+
+.signature_local_free:
     pop rdx
-    jnc fail_token_invalid
 
     NODE_NAME_ALIGNED_SIZE rcx, rbp
     lea rax, [rbp + NODE_BODY + rcx + 8]
@@ -952,13 +964,22 @@ compile_signature:
     jmp .signature_outputs
 
 .signature_output_reuse:
-    call find_current_local
+    call find_scope
     jc fail_notfound
 
+    # output must resolve to a local
+    lea rcx, [rip + word_local]
+    cmp [rax + NODE_CODE], rcx
+    jne fail_token_invalid
+
+    # local must belong to this definition (not parent's or type's)
     call node_local_binding
     mov r10, rax
-    and r10d, 7
-    
+    and rax, -8
+    cmp rax, rbp
+    jne fail_token_invalid
+
+    and r10d, 7    
     lea rdi, [rsp]
     call signature_reuse_output
     jmp .signature_outputs
@@ -1032,13 +1053,6 @@ compile_local:
     or r11, [rsp + 8] # slot
     mov [rcx], r11
 
-    # node_add's prev-node cell is overwritten => local binding
-    # node_finalize will add one back later
-    mov rcx, [rax + NODE_END]
-    mov r11, rbp
-    or r11, [rsp + 8]
-    mov [rcx], r11
-
     # local payload
     mov r9, rbp
     mov rbp, rax
@@ -1096,11 +1110,8 @@ word_ctrl_open:
     mov qword ptr [rip + state], STATE_DEF
 
     call compile_definition_open
-
-    call compile_ctrl_open
     ret
 
-    # fall through here, both modes compile ctrl open
 .ctrl_open_nested:
     # next token figures out : anonymous control region or scoped def
     call read_token
@@ -1228,69 +1239,6 @@ word_over:
     mov r13, rax
     ret
 
-# rax = dictionary node being executed
-word_exec:
-    push rbp
-    push r12
-    push rbx
-    # did this invocation establish the compile target?
-    push 0
-
-    # if compile-time code in definition, preserve the definition being defined
-    cmp qword ptr [rip + state], STATE_DEF
-    jne .exec_target_ready
-
-    # nested calls from an immediate reuses the existing target
-    mov r10, rax
-    call scope_compile_target
-    mov rax, r10
-    jnc .exec_target_ready
-
-    # rbp = definition being compiled
-    # no target, save current r12 compile cursor
-    mov [rbp + NODE_END], r12
-
-    lea rcx, [rip + scope_stack_end]
-    cmp rbx, rcx
-    jae fail_stack_overflow
-
-    mov rdx, rbp
-    or rdx, SCOPE_COMPILE_TAG
-    mov [rbx], rdx
-    add rbx, 8
-
-    mov qword ptr [rsp], 1
-.exec_target_ready:
-    mov rbp, rax
-    call node_exec_start
-
-.exec_next:
-    cmp r12, [rbp + NODE_END]
-    je .exec_done
-
-    mov rax, [r12]
-    add r12, 8
-    mov rdx, [rax + NODE_CODE]
-    call rdx
-    jmp .exec_next
-
-.exec_done:
-    # if compile target modified NODE_END for compile time emission
-    cmp qword ptr [rsp], 0
-    je .exec_restore
-
-    # stack: rsp + 24 = saved rbp compile target
-    mov rax, [rsp + 24]
-    mov rax, [rax + NODE_END]
-    mov [rsp + 16], rax
-
-.exec_restore:
-    add rsp, 8
-    pop rbx
-    pop r12
-    pop rbp
-    ret
-    
 word_add:
     sub r15, 8
     add r13, [r15]
@@ -1306,6 +1254,86 @@ word_sub:
 word_mul:
     sub r15, 8
     imul r13, [r15]
+    ret
+
+# rax = dictionary node being executed
+word_exec:
+    push rbp
+    push r12
+    push rbx
+
+    # cached signature header
+    # bit 63 = this invocation established the compile target
+    push 0
+
+    # if compile-time code in definition, preserve the definition being defined
+    cmp qword ptr [rip + state], STATE_DEF
+    jne .exec_target_ready
+
+    # nested calls from an immediate reuse the existing target
+    mov r10, rax
+    call scope_compile_target
+    mov rax, r10
+    jnc .exec_target_ready
+
+    # no target: preserve current compile cursor
+    mov [rbp + NODE_END], r12
+
+    lea rcx, [rip + scope_stack_end]
+    cmp rbx, rcx
+    jae fail_stack_overflow
+
+    mov rdx, rbp
+    or rdx, SCOPE_COMPILE_TAG
+    mov [rbx], rdx
+    add rbx, 8
+
+    # use reserved header bit as our saved flag
+    bts qword ptr [rsp], 63
+
+.exec_target_ready:
+    mov rbp, rax
+
+    # establishes r12 and, for signed words, invocation frame
+    # returns signature header in r11
+    call node_exec_enter
+
+    # cache header alongside compile-target flag
+    or [rsp], r11
+
+.exec_next:
+    cmp r12, [rbp + NODE_END]
+    je .exec_done
+
+    mov rax, [r12]
+    add r12, 8
+    mov rdx, [rax + NODE_CODE]
+    call rdx
+    jmp .exec_next
+
+.exec_done:
+    # preserve compile cursor if this call established the target
+    bt qword ptr [rsp], 63
+    jnc .exec_leave
+
+    mov rax, [rsp + 24]
+    mov rax, [rax + NODE_END]
+    mov [rsp + 16], rax
+
+.exec_leave:
+    mov r11, [rsp]
+
+    # unsigned word: no invocation frame
+    test r11d, 0xfff
+    jz .exec_restore
+
+    call node_exec_leave
+
+.exec_restore:
+    add rsp, 8
+    pop rbx
+    pop r12
+    pop rbp
     ret
 
 word_write:
@@ -1360,7 +1388,7 @@ word_div:
 
 word_tick:
     call read_token
-    call find_word
+    call find_scope
     jc fail_notfound
 
     mov [r15], r13 # old TOS = NOS
@@ -1696,7 +1724,7 @@ word_member_dispatch:
     mov rsi, rax
     mov r9, rcx
     mov r8, r10
-    call find_scope_local
+    call find_member
     jnc .md_run             # override found in context's chain
 
     # not found: fall back to the statically-resolved node
@@ -1707,8 +1735,42 @@ word_member_dispatch:
     call rdx
     ret
 
+word_local_get:
+    mov rax, [r12]
+    add r12, 8
+
+    # slot = low 3 bits
+    mov r10, rax
+    and r10d, 7
+
+    # find owning def
+    and rax, -8
+    call scope_invocation_frame
+    jc fail_local
+
+    mov rax, [rax]
+
+    # local must contain a valid value
+    mov ecx, r10d
+    add rcx, 31
+    bt rax, rcx
+    jnc fail_local
+
+    # decode local base (where data stack should end up at end of execution)
+    shr rax, 17
+    and eax, 0x3fff
+    lea rdx, [rip + data_stack]
+    lea rax, [rdx + rax * 8]
+
+    # push local value to data stack
+    mov [r15], r13
+    add r15, 8
+    mov r13, [rax + r10 * 8]
+    ret
+
+# Should not be executed at runtime, only compile time
 word_local:
-    jmp fail_state
+    jmp fail_compile_node
 
 words_end:
 
@@ -1761,19 +1823,192 @@ node_exec_set_code_start:
     or [rcx], rdx
     ret
 
-# rax = word_exec node
+# rbp = word_exec node
 # returns:
-#  r12 = first threaded instruction in code payload
-node_exec_start:
-    NODE_NAME_ALIGNED_SIZE rcx, rax
+#   r11 = signature header
+#   r12 = first threaded instruction
+node_exec_enter:
+    NODE_NAME_ALIGNED_SIZE rcx, rbp
+    mov r11, [rbp + NODE_BODY + rcx + 8]
 
-    # word_exec payload begins with signature header
-    mov rdx, [rax + NODE_BODY + rcx + 8]
+    # code-start qword offset
+    mov r12, r11
+    shr r12, 36
+    and r12d, DICT_QWORDS - 1
+    lea r12, [rbp + NODE_BODY + r12 * 8]
 
-    shr rdx, 36
-    and edx, DICT_QWORDS - 1
-    lea rcx, [rax + NODE_BODY]
-    lea r12, [rcx + rdx * 8]
+    # no inputs, outputs or locals
+    test r11d, 0xfff
+    jz .exec_enter_done
+
+    # r8 = input count
+    mov r8d, r11d
+    and r8d, 0xf
+
+    # r9 = local count
+    mov r9, r11
+    shr r9, 8
+    and r9d, 0xf
+
+    # r10 = caller cursor
+    mov rcx, r8
+    shl rcx, 3
+    mov r10, r15
+    sub r10, rcx
+
+    lea rcx, [rip + data_stack]
+    cmp r10, rcx
+    jb fail_stack_underflow
+
+    # rdx = local base
+    lea rdx, [r10 + 8]
+
+    # r9 = temporary floor
+    lea r9, [rdx + r9 * 8]
+
+    lea rcx, [rip + data_stack_end]
+    cmp r9, rcx
+    ja fail_stack_overflow
+
+    lea rcx, [rip + scope_stack_end]
+    cmp rbx, rcx
+    jae fail_stack_overflow
+
+    # owner occupies bits 3..16 as dictionary byte offset
+    mov rax, rbp
+    lea rcx, [rip + dict]
+    sub rax, rcx
+
+    # local-base byte offset << 14 gives qword index in bits 17..
+    lea rsi, [rip + data_stack]
+    sub rdx, rsi
+    shl rdx, 14
+    or rax, rdx
+
+    # initial validity mask = (1 << input_count) - 1
+    mov ecx, r8d
+    mov edx, 1
+    shl rdx, cl
+    dec rdx
+    shl rdx, 31
+    or rax, rdx
+
+    # invocation-frame marker
+    bts rax, 63
+
+    mov [rbx], rax
+    add rbx, 8
+
+    # spill cached input TOS only after all bounds checks succeeded
+    mov [r15], r13
+
+    # body stack starts above local storage
+    mov r13, [r10]
+    mov r15, r9
+.exec_enter_done:
+    ret
+
+# rbp = word_exec node
+# r11 = cached signature header
+node_exec_leave:
+    # invocation frame must be on top
+    lea rcx, [rip + scope_stack]
+    cmp rbx, rcx
+    je fail_local
+
+    sub rbx, 8
+    mov rax, [rbx]
+
+    test rax, rax
+    jns fail_local
+
+    # verify frame belongs to this definition
+    mov rdx, rbp
+    lea rcx, [rip + dict]
+    sub rdx, rcx
+
+    mov ecx, eax
+    and ecx, DICT_SIZE - 8
+    cmp rcx, rdx
+    jne fail_local
+
+    # r8 = local base
+    mov r8, rax
+    shr r8, 17
+    and r8d, 0x3fff
+
+    lea rcx, [rip + data_stack]
+    lea r8, [rcx + r8 * 8]
+
+    # body must not have dropped below its local frame
+    mov rcx, r11
+    shr rcx, 8
+    and ecx, 0xf
+    lea rcx, [r8 + rcx * 8]
+
+    cmp r15, rcx
+    jb fail_local
+
+    # r9 = validity mask
+    mov r9, rax
+    shr r9, 31
+    and r9d, 0xff
+
+    # r10 = output count
+    mov r10, r11
+    shr r10, 4
+    and r10d, 0xf
+
+    test r10, r10
+    jz .exec_reclaim
+
+    # shift first output ref to bit zero
+    mov ecx, r11d
+    and ecx, 0xf
+    lea ecx, [rcx + rcx * 2 + 12]
+    shr r11, cl
+
+    # stage outputs before local storage is reclaimed
+    mov rsi, r10
+
+.exec_stage_output:
+    mov edx, r11d
+    and edx, 7
+
+    bt r9, rdx
+    jnc fail_local
+
+    push qword ptr [r8 + rdx * 8]
+
+    shr r11, 3
+    dec rsi
+    jnz .exec_stage_output
+
+.exec_reclaim:
+    # restore caller stack after consuming all inputs
+    lea r15, [r8 - 8]
+    mov r13, [r15]
+
+    test r10, r10
+    jz .exec_leave_done
+
+    # staged values are reversed on the machine stack;
+    # begin with the first declared output
+    lea rdx, [rsp + r10 * 8 - 8]
+    mov rsi, r10
+
+.exec_emit_output:
+    mov [r15], r13
+    add r15, 8
+    mov r13, [rdx]
+
+    sub rdx, 8
+    dec rsi
+    jnz .exec_emit_output
+
+    lea rsp, [rsp + r10 * 8]
+
+.exec_leave_done:
     ret
 
 # rax = node
@@ -1832,57 +2067,41 @@ scope_target:
     stc
     ret
 
-# r8 = scope node
-# rsi = name address
-# r9 = name address
-# Search order: scope children, scope's type children, type chain
-# returns:
-#   rax = matching node
-#   CF = 0 found
-#   CF = 1 not found
-# clobbers:
-#   rax, rcx, rdx, r8, r10
-find_scope_local:
-.scope_local_next:
+# r8 = node
+# rsi = name
+# r9 = name len
+# returns: find_dict
+# Search only this node's direct child dictionary
+find_node:
     mov rax, r8
     call node_locals_ref
     mov rdx, [rax]
+    jmp find_dict
 
-    test rdx, rdx
-    jz .scope_local_type
+# r8 = node
+# rsi = member name
+# r9 = member name len
+# Searches node children, node type's children, inherited type chain
+# returns:
+#   CF = 0 found
+#   CF = 1 not
+find_member:
+.find_member_next:
+    call find_node
+    jnc .find_member_done
 
-    call find_dict
-    jnc .scope_local_done
-
-.scope_local_type:
     mov rax, r8
     call node_type
 
     test rax, rax
-    jz .scope_local_missing
+    jz .find_member_missing
 
     mov r8, rax
-    jmp .scope_local_next
-
-.scope_local_done:
-    ret
-.scope_local_missing:
+    jmp .find_member_next
+.find_member_missing:
     stc
+.find_member_done:
     ret
-
-# rbp = parent to local definition
-# rsi = name
-# r9 = name len
-# returns:
-#   rax = matching direct local def
-#   CF = 0 found
-#   CF = 1 not found
-# NOTE: Purposely does not look outside defining parent
-find_current_local:
-    mov rax, rbp
-    call node_locals_ref
-    mov rdx, [rax]
-    jmp find_dict
 
 # returns:
 #   rax = context node of the innermost active qualified member call, 0 if none
@@ -1903,6 +2122,43 @@ scope_context:
     ret
 .recv_missing:
     xor rax, rax
+    ret
+
+# rax = owning definition
+# returns:
+#   rax = address of packed active invocation
+#   CF = 0 found
+#   CF = 1 not
+scope_invocation_frame:
+    lea rdx, [rip + dict]
+    sub rax, rdx
+    mov r8, rax
+
+    mov rcx, rbx
+    lea rdx, [rip + scope_stack]
+
+.scope_invocation_next:
+    cmp rcx, rdx
+    je .scope_invocation_missing
+
+    sub rcx, 8
+    mov r9, [rcx]
+
+    # invocation frame have bit 64 set
+    test r9, r9
+    jns .scope_invocation_next
+
+    # bits 3..16 are aligned dict offset
+    mov eax, r9d
+    and eax, DICT_SIZE - 8
+    cmp rax, r8
+    jne .scope_invocation_next
+
+    mov rax, rcx
+    clc
+    ret
+.scope_invocation_missing:
+    stc
     ret
 
 # returns:
@@ -1928,8 +2184,6 @@ scope_compile_target:
     stc
     ret
 
-    ret
-
 # rsi = name address
 # r9 = name length
 # returns:
@@ -1945,7 +2199,7 @@ find_scope:
 
     # current word is static
     mov r8, rbp
-    call find_scope_local
+    call find_node
     jnc .find_scope_static
 
 # find immediate defining scope
@@ -1963,9 +2217,15 @@ find_scope:
     and rax, -8
     mov r8, rax
 
-    # parent's scope is overrideable
-    call find_scope_local
-    jnc .find_scope_virtual
+    # works in immediate parent remain overrideable
+    # a local is always the exact local node
+    call find_node
+    jc .find_scope_outer
+
+    lea rdx, [rip + word_local]
+    cmp [rax + NODE_CODE], rdx
+    je .find_scope_static
+    jmp .find_scope_virtual
 
     # anything further out is normal lookup
 .find_scope_outer:
@@ -1982,14 +2242,16 @@ find_scope:
     and rax, -8
     mov r8, rax
 
-    call find_scope_local
+    call find_node
     jc .find_scope_outer
 
 .find_scope_static:
     mov r10d, 0
+    clc
     ret
 .find_scope_virtual:
     mov r10d, 1
+    clc
     ret
 .find_scope_root:
     mov rdx, r14
@@ -1997,16 +2259,6 @@ find_scope:
     # preserve CF from find_dict
     mov r10d, 0
     ret
-
-# rsi = name address
-# r9 = name length
-# returns:
-#   rax = matching node
-#   CF=0 found
-#   CF=1 not found
-find_word:
-    mov rdx, r14
-    jmp find_dict
 
 # rsi = name address
 # r9 = name length
@@ -2070,7 +2322,6 @@ eval_token:
     # r8 = context name len
     # rsi = member name
     # r9 = member name len
-
     push rsi
     push r9
     mov rsi, rax
@@ -2083,7 +2334,7 @@ eval_token:
     # resolve member through context chain
     mov r8, rax
     push r8
-    call find_scope_local
+    call find_member
     pop r8
     jc fail_notfound
 
@@ -2095,6 +2346,11 @@ eval_token:
     mov rdx, [rax + NODE_CODE]
     cmp qword ptr [rip + state], STATE_EXE
     je .eval_exec
+
+    # locals: emit compiled local
+    lea rcx, [rip + word_local]
+    cmp rdx, rcx
+    je .eval_compile_local
 
     # def: execute immediates
     test qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
@@ -2110,6 +2366,17 @@ eval_token:
     mov qword ptr [r12 + 8], 0
     mov [r12 + 16], rax
     add r12, 24
+    ret
+
+.eval_compile_local:
+    # rax = local node
+    call node_local_binding
+
+    # emit runtime read + packed owner|slot
+    mov [r12 + 8], rax
+    lea rax, [rip + internal_local_get]
+    mov [r12], rax
+    add r12, 16
     ret
 
 .eval_compile_static:
@@ -2196,7 +2463,8 @@ eval_token:
     mov rbp, rax
 
     call node_exec_header_init
-    call compile_definition_open
+    mov rax, rbp
+    call node_exec_set_code_start
 
     # push constructor target
     lea rcx, [rip + scope_stack_end]
@@ -2351,7 +2619,6 @@ _start:
 
 .repl_loop:
     call read_token
-    # rax = return, can be EOF, but handy for bootstrapping and continuing repl
     call eval_token
     jmp .repl_loop
 
@@ -2376,6 +2643,8 @@ fail_stack_overflow:
     lea rsi, [rip + err_stack_overflow]
     jmp fail
 fail_token_eof:
+    cmp qword ptr [rip + state], STATE_DEF
+    je fail_token_noclose
     mov rax, E_EOF
     lea rsi, [rip + err_token]
     jmp fail
@@ -2395,8 +2664,16 @@ fail_token_noopen:
     mov rax, E_SYN
     lea rsi, [rip + err_token_noopen]
     jmp fail
+fail_compile_node:
+    mov rax, E_SYN
+    lea rsi, [rip + err_compile_node]
+    jmp fail
 fail_state:
     mov rax, E_SYN
     lea rsi, [rip + err_state]
+    jmp fail
+fail_local:
+    mov rax, E_STA
+    lea rsi, [rip + err_state_local]
     jmp fail
         
