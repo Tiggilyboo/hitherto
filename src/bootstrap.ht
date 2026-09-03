@@ -1,57 +1,58 @@
+[ :linux
+    # read: fd buf count -> result
+    # Linux syscall 0
+    [ :read
+        $3 !        # count
+        $2 !        # buffer address
+        $1 !        # file descriptor
+        0 $0 !      # SYS_read
+        sys
+        $0 @        # return value
+    ]
 
-# read: fd buf count -> result
-# Linux syscall 0
-[ :read
-    $3 !        # count
-    $2 !        # buffer address
-    $1 !        # file descriptor
-    0 $0 !      # SYS_read
-    sys
-    $0 @        # return value
-]
+    # write: fd buf count -> result
+    # Linux syscall 1
+    [ :write
+        $3 !        # count
+        $2 !        # buffer address
+        $1 !        # file descriptor
+        1 $0 !      # SYS_write
+        sys
+        $0 @        # return value
+    ]
 
-# write: fd buf count -> result
-# Linux syscall 1
-[ :write
-    $3 !        # count
-    $2 !        # buffer address
-    $1 !        # file descriptor
-    1 $0 !      # SYS_write
-    sys
-    $0 @        # return value
-]
+    # open: filename -> fd
+    # Linux syscall 2
+    [ :open
+        0 $2 !      # mode
+        0 $1 !      # O_RDONLY
+        $0 !        # filename address
+        2 $0 !      # SYS_open
+        sys
+        $0 @        # return fd
+    ]
 
-# open: filename -> fd
-# Linux syscall 2
-[ :open
-    0 $2 !      # mode
-    0 $1 !      # O_RDONLY
-    $0 !        # filename address
-    2 $0 !      # SYS_open
-    sys
-    $0 @        # return fd
-]
+    # exit: status -> nothing
+    # Linux syscall 60
+    [ :exit
+        $1 !        # exit status
+        60 $0 !     # SYS_exit
+        sys
+    ]
 
-# exit: status -> nothing
-# Linux syscall 60
-[ :exit
-    $1 !        # exit status
-    60 $0 !     # SYS_exit
-    sys
-]
-
-# mmap: length -> result
-# Linux syscall 9
-[ :mmap
-    $2 !        # length, consume from stack
-    9 $0 !      # SYS_MMAP
-    0 $1 !      # addr = null
-    3 $3 !      # PROT_READ | PROT_WRITE
-    34 $4 !     # MAP_PRIVATE | MAP_ANONYMOUS
-    -1 $5 !     # fd
-    0 $6 !      # offset
-    sys
-    $0 @        # return value
+    # mmap: length -> result
+    # Linux syscall 9
+    [ :mmap
+        $2 !        # length, consume from stack
+        9 $0 !      # SYS_MMAP
+        0 $1 !      # addr = null
+        3 $3 !      # PROT_READ | PROT_WRITE
+        34 $4 !     # MAP_PRIVATE | MAP_ANONYMOUS
+        -1 $5 !     # fd
+        0 $6 !      # offset
+        sys
+        $0 @        # return value
+    ]
 ]
 
 [ :nop ]
@@ -62,9 +63,9 @@
         [ :init
             [ :mmap-err
                 -1
-                exit
+                linux~exit
             ]
-            1048576 mmap
+            1048576 linux~mmap
             [
                 ^ 0 < ? mmap-err
             ]
@@ -105,7 +106,7 @@
     ]
     [ :alloc
         [ :overflow
-            1 exit
+            1 linux~exit
         ]
         cursor ><
 
@@ -129,19 +130,19 @@
         [ 0x4d 0x0f 0xb6 0x6d 0x00 asm ]
     ]
     [ :read
-        [ :abort 1 exit ]
+        [ :abort 1 linux~exit ]
 
         ^ # keep ptr
         0 >< # fd buf
         1 # count 
-        read
+        linux~read
         1 = 0 = ? abort
     ]
 ]
 
 # String literals
 [ :"
-    [ :overflow 1 exit ]
+    [ :overflow 1 linux~exit ]
     [ :done
         <^ -
         # ptr len
@@ -176,10 +177,10 @@
 # str is a printable memory span (ie. the string type)
 [ memory:str
     [ :.
-        [ :write-err 1 exit ]
+        [ :write-err 1 linux~exit ]
         1 # stdout
         span
-        write
+        linux~write
         0 < ? write-err
     ]
 ]

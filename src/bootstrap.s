@@ -101,35 +101,39 @@ token_type:
     .asciz "type"
 token_lit:
     .asciz "lit"
+token_to:
+    .asciz "to"
+token_newline:
+    .asciz "\n"
 
 err_unknown:
-    .asciz "Unknown error occurred\n"
-err_token:
-    .asciz "Error reading token\n"
-err_token_len:
-    .asciz "Token length must be less than 31\n"
+    .asciz "Unknown error occurred near: "
 err_dict_notfound:
-    .asciz "Dictionary did not contain token\n"
-err_token_invalid:
-    .asciz "Token invalid\n"
-err_token_noclose:
-    .asciz "Missing close token\n"
-err_token_noopen:
-    .asciz "Missing open token\n"
-err_div_zero:
-    .asciz "Divide by zero\n"
-err_stack_underflow:
-    .asciz "Stack underflow\n"
-err_stack_overflow:
-    .asciz "Stack overflow\n"
+    .asciz "Dictionary did not contain token: "
 err_dict_overflow:
-    .asciz "Dictionary full\n"
+    .asciz "Dictionary full: "
+err_token:
+    .asciz "Error reading token: "
+err_token_len:
+    .asciz "Token length must be less than 31: "
+err_token_invalid:
+    .asciz "Token invalid: "
+err_token_noclose:
+    .asciz "Missing close token: "
+err_token_noopen:
+    .asciz "Missing open token: "
+err_div_zero:
+    .asciz "Divide by zero near: "
+err_stack_underflow:
+    .asciz "Stack underflow near: "
+err_stack_overflow:
+    .asciz "Stack overflow near: "
 err_state:
-    .asciz "Already in define state\n"
-err_compile_node:
-    .asciz "Node not consumed at compile time tried to execute at runtime\n"
+    .asciz "Already in define state, near: "
 err_state_local:
-    .asciz "Invalid local state\n"
+    .asciz "Invalid local state near: "
+err_compile_node:
+    .asciz "Node not consumed at compile time tried to execute at runtime near: "
 
 .align 8
 internal_lit:
@@ -148,6 +152,8 @@ internal_member_dispatch:
     .quad word_member_dispatch
 internal_local_get:
     .quad word_local_get
+internal_local_set:
+    .quad word_local_set
 
 .section .bss
 
@@ -162,6 +168,8 @@ write_buf:
     .skip TOKEN_MAX_LEN
 token_buf:
     .skip TOKEN_MAX_LEN
+token_len:
+    .quad 0
 
 .align 8
 scope_stack:
@@ -238,20 +246,38 @@ len:
 
 exit:
     mov eax, 60
-    xor edi, edi
-    mov rdi, rax
     syscall
-    ret
 
+# rsi = error message
 fail:
-    # assumes rsi populated with string pointer
+    push rax
     cmp rsi, 0
     je .fail_done
-    xor edx, edx
     call len
     mov rdx, rax
-.fail_done:
     call write_err
+.fail_done:
+    pop rdi
+    neg edi
+    jmp exit
+
+# rsi = error message
+fail_token:
+    push rax
+
+    call len
+    mov rdx, rax
+    call write_err
+
+    lea rsi, [rip + token_buf]
+    mov rdx, [rip + token_len]
+    call write_err
+    lea rsi, [rip + token_newline]
+    mov edx, 1
+    call write_err
+
+    pop rdi
+    neg edi
     jmp exit
 
 # rsi = integer bytes
@@ -514,10 +540,8 @@ read_token:
 
 .single:
     mov byte ptr [rip + token_buf], al
-    lea rsi, [rip + token_buf]
-    mov r9d, 1
-    xor eax, eax
-    ret
+    mov rcx, 1
+    jmp .done
 
 .next:
     cmp rcx, TOKEN_MAX_LEN
@@ -540,6 +564,7 @@ read_token:
 
 .done:
     lea rsi, [rip + token_buf]
+    mov [rip + token_len], rcx
     mov r9, rcx
     xor eax, eax
     ret
@@ -762,6 +787,15 @@ compile_ctrl_open:
 # clobbers:
 #  rcx, rdx, r8, r9, r11
 compile_child_declaration:
+    # child words may override words, but never a local
+    call find_scope
+    jc .child_name_available
+
+    lea rcx, [rip + word_local]
+    cmp [rax + NODE_CODE], rcx
+    je fail_token_invalid
+
+.child_name_available:
     # skip inline child node
     lea rax, [rip + internal_skip]
     mov [r12], rax
@@ -1768,9 +1802,70 @@ word_local_get:
     mov r13, [rax + r10 * 8]
     ret
 
+# [r12] = packed owner | slot
+word_local_set:
+    mov rax, [r12]
+    add r12, 8
+
+    # slot
+    mov r10, rax
+    and r10d, 7
+
+    # find invocation frame for owner
+    and rax, -8
+    call scope_invocation_frame
+    jc fail_local
+
+    # preserve address of packed frame
+    mov r11, rax
+    mov rax, [rax]
+
+    # local base
+    shr rax, 17
+    and eax, 0x3fff
+
+    lea rdx, [rip + data_stack]
+    lea rax, [rdx + rax * 8]
+
+    # set TOS = local
+    mov [rax + r10 * 8], r13
+
+    # set local valid
+    mov ecx, r10d
+    add ecx, 31
+    bts qword ptr [r11], rcx
+
+    # consume value from TOS
+    sub r15, 8
+    mov r13, [r15]
+    ret
+
 # Should not be executed at runtime, only compile time
 word_local:
     jmp fail_compile_node
+
+word_to:
+    cmp qword ptr [rip + state], STATE_DEF
+    jne fail_state
+
+    # consume local (name)
+    call read_token
+    call find_scope
+    jc fail_notfound
+
+    # validate it's a local
+    lea rcx, [rip + word_local]
+    cmp [rax + NODE_CODE], rcx
+    jne fail_token_invalid
+
+    # emit internal_local_set + owner|slot
+    call node_local_binding
+    mov [r12 + 8], rax
+
+    lea rax, [rip + internal_local_set]
+    mov [r12], rax
+    add r12, 16
+    ret
 
 words_end:
 
@@ -2514,6 +2609,7 @@ _start:
     xor r14d, r14d # dict must be null (0) for first node_add call
     lea r15, [rip + data_stack]
     lea rbx, [rip + scope_stack]
+    mov qword ptr [rip + token_len], 0
 
     # load builtins into dict
 .load_builtins:
@@ -2617,6 +2713,13 @@ _start:
     call dict_add_z
     or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
+    lea rsi, [rip + token_to]
+    lea rdi, [rip + word_to]
+    call dict_add_z
+    or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
+
+    
+
 .repl_loop:
     call read_token
     call eval_token
@@ -2625,55 +2728,54 @@ _start:
 fail_notfound:
     mov rax, E_DIC
     lea rsi, [rip + err_dict_notfound]
-    jmp fail
+    jmp fail_token
 fail_dict_overflow:
     mov rax, E_DIC
     lea rsi, [rip + err_dict_overflow]
-    jmp fail
+    jmp fail_token
 fail_div_zero:
     mov rax, E_DIV
     lea rsi, [rip + err_div_zero]
-    jmp fail
+    jmp fail_token
 fail_stack_underflow:
     mov ax, E_STA
     lea rsi, [rip + err_stack_underflow]
-    jmp fail
+    jmp fail_token
 fail_stack_overflow:
     mov ax, E_STA
     lea rsi, [rip + err_stack_overflow]
-    jmp fail
+    jmp fail_token
 fail_token_eof:
     cmp qword ptr [rip + state], STATE_DEF
     je fail_token_noclose
-    mov rax, E_EOF
-    lea rsi, [rip + err_token]
-    jmp fail
+    xor edi, edi
+    jmp exit
 fail_token_invalid:
     mov rax, E_SYN
     lea rsi, [rip + err_token_invalid]
-    jmp fail
+    jmp fail_token
 fail_token_overflow:
     mov rax, E_LEN
     lea rsi, [rip + err_token_len]
-    jmp fail
+    jmp fail_token
 fail_token_noclose:
     mov rax, E_SYN
     lea rsi, [rip + err_token_noclose]
-    jmp fail
+    jmp fail_token
 fail_token_noopen:
     mov rax, E_SYN
     lea rsi, [rip + err_token_noopen]
-    jmp fail
+    jmp fail_token
 fail_compile_node:
     mov rax, E_SYN
     lea rsi, [rip + err_compile_node]
-    jmp fail
+    jmp fail_token
 fail_state:
     mov rax, E_SYN
     lea rsi, [rip + err_state]
-    jmp fail
+    jmp fail_token
 fail_local:
     mov rax, E_STA
     lea rsi, [rip + err_state_local]
-    jmp fail
+    jmp fail_token
         
