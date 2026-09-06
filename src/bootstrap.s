@@ -25,7 +25,6 @@
 
 # Max depth of scope stack depth
 .equ SCOPE_MAX, 64
-
 .equ SCOPE_TAG_MASK, 7
 # Enclosing definition (outside of [)
 .equ SCOPE_PARENT_TAG, 1
@@ -33,13 +32,6 @@
 .equ SCOPE_CONTEXT_TAG, 2
 # Active definition receiving emitted code
 .equ SCOPE_COMPILE_TAG, 4
-
-.equ E_EOF, -1
-.equ E_LEN, -2
-.equ E_DIC, -3
-.equ E_SYN, -4
-.equ E_DIV, -5
-.equ E_STA, -6
 
 .section .rodata
 
@@ -93,6 +85,8 @@ token_loop:
     .asciz "~["
 token_break:
     .asciz "~]"
+token_jump:
+    .asciz "~_"
 token_immediate:
     .asciz "immediate"
 token_asm:
@@ -103,37 +97,10 @@ token_lit:
     .asciz "lit"
 token_to:
     .asciz "to"
+token_panic:
+    .asciz "panic"
 token_newline:
     .asciz "\n"
-
-err_unknown:
-    .asciz "Unknown error occurred near: "
-err_dict_notfound:
-    .asciz "Dictionary did not contain token: "
-err_dict_overflow:
-    .asciz "Dictionary full: "
-err_token:
-    .asciz "Error reading token: "
-err_token_len:
-    .asciz "Token length must be less than 31: "
-err_token_invalid:
-    .asciz "Token invalid: "
-err_token_noclose:
-    .asciz "Missing close token: "
-err_token_noopen:
-    .asciz "Missing open token: "
-err_div_zero:
-    .asciz "Divide by zero near: "
-err_stack_underflow:
-    .asciz "Stack underflow near: "
-err_stack_overflow:
-    .asciz "Stack overflow near: "
-err_state:
-    .asciz "Already in define state, near: "
-err_state_local:
-    .asciz "Invalid local state near: "
-err_compile_node:
-    .asciz "Node not consumed at compile time tried to execute at runtime near: "
 
 .align 8
 internal_lit:
@@ -162,8 +129,12 @@ state:
     .quad 0
 reg_data:
     .skip 64
-io_char:
-    .skip 1
+panic_handler:
+    .quad 0
+io_data:
+    .quad 0
+io_length:
+    .quad 0
 write_buf:
     .skip TOKEN_MAX_LEN
 token_buf:
@@ -195,35 +166,113 @@ native_here:
 
 .section .text
 
-read_char:
-    push rcx
-    mov eax, 0                    # SYS_read
-    xor edi, edi                  # stdin
-    lea rsi, [rip + io_char]
-    mov edx, 1
+.equ P_STATE, 1
+.equ P_DICT_NOTFOUND, 2
+.equ P_DICT_OVERFLOW, 3
+.equ P_STACK_UNDERFLOW, 4
+.equ P_STACK_OVERFLOW, 5
+.equ P_TOKEN_INVALID, 6
+.equ P_TOKEN_OVERFLOW, 7
+.equ P_TOKEN_NOCLOSE, 8
+.equ P_TOKEN_NOOPEN, 9
+.equ P_COMPILE_NODE, 10
+.equ P_DIV_ZERO, 11
+.equ P_LOCAL, 12
+
+.equ PANIC_CODE, 0
+.equ PANIC_STATE, 8
+.equ PANIC_RBP, 16
+.equ PANIC_RBX, 24
+.equ PANIC_R12, 32
+.equ PANIC_R13, 40
+.equ PANIC_R14, 48
+.equ PANIC_R15, 56
+.equ PANIC_RSP, 64
+.equ PANIC_SIZE, 72
+
+# eax = P_*
+panic:
+    sub rsp, PANIC_SIZE
+
+    mov [rsp + PANIC_CODE], rax
+    
+    mov rcx, [rip + state]
+    mov [rsp + PANIC_STATE], rcx
+
+    mov [rsp + PANIC_RBP], rbp
+    mov [rsp + PANIC_RBX], rbx
+    mov [rsp + PANIC_R12], r12
+    mov [rsp + PANIC_R13], r13
+    mov [rsp + PANIC_R14], r14
+    mov [rsp + PANIC_R15], r15
+
+    lea rcx, [rsp + PANIC_SIZE]
+    mov [rsp + PANIC_RSP], rcx
+
+panic_dispatch:
+    mov rax, [rip + panic_handler]
+    test rax, rax
+    jz .panic_exit
+
+    # debugger must execute even if panic occurred while compiling
+    mov qword ptr [rip + state], STATE_EXE
+
+    # panic frame address as TOS
+    mov [r15], r13
+    add r15, 8
+    mov r13, rsp
+
+    # rax = registered handler node
+    mov rdx, [rax + NODE_CODE]
+    call rdx
+
+    # if no panic_handler
+.panic_exit:
+    mov edi, dword ptr [rsp + PANIC_CODE]
+    mov rax, 60
     syscall
 
-    cmp rax, 1
-    jne .read_char_eof
+# returns:
+#   al = character
+#   CF = 0 success
+#   CF = 1 EOF
+read_char:
+    cmp qword ptr [rip + io_length], 0
+    jne .read_char_cached
 
-    movzx eax, byte ptr [rip + io_char]
+    # refill up to one qword
+    push rcx
+
+    xor eax, eax # SYS_read
+    xor edi, edi # stdin
+    lea rsi, [rip + io_data]
+    mov edx, 8
+    syscall
+
     pop rcx
+
+    # zero = EOF; negative syscall error currently behaves as EOF too
+    test rax, rax
+    jle .read_char_eof
+
+    mov [rip + io_length], rax
+
+.read_char_cached:
+    # little-endian: next byte is always the low byte
+    movzx eax, byte ptr [rip + io_data]
+    shr qword ptr [rip + io_data], 8
+    dec qword ptr [rip + io_length]
+
+    clc
     ret
 
 .read_char_eof:
-    mov rax, E_EOF
-    pop rcx
+    stc
     ret
 
 write:
     mov eax, 1 # sys_write
     mov edi, 1 # stdout
-    syscall
-    ret
-
-write_err:
-    mov eax, 1 # sys_write
-    mov edi, 2 # stderr
     syscall
     ret
 
@@ -243,42 +292,6 @@ len:
     mov rax, rdi
     sub rax, rsi
     ret
-
-exit:
-    mov eax, 60
-    syscall
-
-# rsi = error message
-fail:
-    push rax
-    cmp rsi, 0
-    je .fail_done
-    call len
-    mov rdx, rax
-    call write_err
-.fail_done:
-    pop rdi
-    neg edi
-    jmp exit
-
-# rsi = error message
-fail_token:
-    push rax
-
-    call len
-    mov rdx, rax
-    call write_err
-
-    lea rsi, [rip + token_buf]
-    mov rdx, [rip + token_len]
-    call write_err
-    lea rsi, [rip + token_newline]
-    mov edx, 1
-    call write_err
-
-    pop rdi
-    neg edi
-    jmp exit
 
 # rsi = integer bytes
 # r9  = byte length
@@ -388,7 +401,6 @@ parse_hex_byte:
 .hex_invalid:
     stc
     ret
-
 
 # rsi = token address
 # r9 = token length
@@ -513,8 +525,7 @@ read_token:
     xor rcx, rcx
 .skip_ws:
     call read_char
-    cmp eax, E_EOF
-    je fail_token_eof
+    jc panic_token_noclose
 
     cmp al, ' ' 
     je .skip_ws
@@ -532,8 +543,7 @@ read_token:
 
 .skip_comment:
     call read_char
-    cmp eax, E_EOF
-    je fail_token_eof
+    jc panic_token_noclose
     cmp al, '\n'
     jne .skip_comment
     jmp .skip_ws
@@ -545,14 +555,13 @@ read_token:
 
 .next:
     cmp rcx, TOKEN_MAX_LEN
-    jge fail_token_overflow
+    jge panic_token_overflow
 
     mov byte ptr [rip + token_buf + rcx], al
     inc rcx
 
     call read_char
-    cmp eax, E_EOF
-    je .done
+    jc .done
 
     cmp al, ' ' 
     je .done
@@ -637,7 +646,7 @@ resolve_declaration_type:
     call find_scope
     pop r9
     pop rsi
-    jc fail_notfound
+    jc panic_dict_notfound
 
     mov rdx, rax
 .resolve_decl_done:
@@ -706,7 +715,7 @@ node_add:
     lea r9, [r8 + 8]
     lea r11, [rip + dict_end]
     cmp r9, r11
-    ja fail_dict_overflow
+    ja panic_dict_overflow
 
     # Runtime behavior.
     mov [rax + NODE_CODE], rdi
@@ -754,7 +763,7 @@ node_add:
 compile_ctrl_open:
     lea rcx, [rip + scope_stack_end]
     cmp rbx, rcx
-    jae fail_stack_overflow
+    jae panic_stack_overflow
 
     lea rax, [rip + internal_ctrl_push]
     mov [r12], rax
@@ -793,7 +802,7 @@ compile_child_declaration:
 
     lea rcx, [rip + word_local]
     cmp [rax + NODE_CODE], rcx
-    je fail_token_invalid
+    je panic_token_invalid
 
 .child_name_available:
     # skip inline child node
@@ -874,7 +883,7 @@ compile_child_publish:
 signature_append_ref:
     SIGNATURE_POSITION_COUNT rcx, r8, rax
     cmp rcx, 8
-    jae fail_token_invalid
+    jae panic_token_invalid
 
     # refs start at 12, each 3 bits
     lea ecx, [rcx + rcx * 2 + 12]
@@ -887,7 +896,7 @@ signature_append_ref:
 signature_require_position:
     SIGNATURE_POSITION_COUNT rcx, r8, rax
     cmp rcx, 8
-    jae fail_token_invalid
+    jae panic_token_invalid
     ret
 
 # rsi/r9 = local name
@@ -904,7 +913,7 @@ signature_declare_local:
 
     lea rcx, [rip + word_local]
     cmp [rax + NODE_CODE], rcx
-    je fail_token_invalid
+    je panic_token_invalid
 
 .signature_local_free:
     pop rdx
@@ -938,7 +947,7 @@ signature_reuse_output:
     call signature_require_position
 
     bt qword ptr [rdi], r10
-    jc fail_token_invalid
+    jc panic_token_invalid
     bts qword ptr [rdi], r10
 
     mov rdx, r10
@@ -965,7 +974,7 @@ compile_signature:
 .signature_input:
     # must declare new local
     call parse_declaration
-    jc fail_token_invalid
+    jc panic_token_invalid
 
     call resolve_declaration_type
 
@@ -999,19 +1008,19 @@ compile_signature:
 
 .signature_output_reuse:
     call find_scope
-    jc fail_notfound
+    jc panic_dict_notfound
 
     # output must resolve to a local
     lea rcx, [rip + word_local]
     cmp [rax + NODE_CODE], rcx
-    jne fail_token_invalid
+    jne panic_token_invalid
 
     # local must belong to this definition (not parent's or type's)
     call node_local_binding
     mov r10, rax
     and rax, -8
     cmp rax, rbp
-    jne fail_token_invalid
+    jne panic_token_invalid
 
     and r10d, 7    
     lea rdi, [rsp]
@@ -1119,11 +1128,11 @@ word_ctrl_open:
     # no anonymous top level regions yet...
     lea rcx, [rip + scope_stack]
     cmp rbx, rcx
-    jne fail_state
+    jne panic_state
 
     call read_token
     call parse_declaration
-    jc fail_token_invalid
+    jc panic_token_invalid
 
     call resolve_declaration_type
     # rsi = name, rdx = type node or 0
@@ -1159,7 +1168,7 @@ word_ctrl_open:
     lea rcx, [rip + scope_stack_end]
     lea rax, [rbx + 16]
     cmp rax, rcx
-    ja fail_stack_overflow
+    ja panic_stack_overflow
 
     lea rdi, [rip + word_exec]
     push rdx
@@ -1192,11 +1201,11 @@ word_ctrl_open:
 
 word_ctrl_close:
     cmp qword ptr [rip + state], STATE_DEF
-    jne fail_state
+    jne panic_state
 
     lea r8, [rip + scope_stack]
     cmp rbx, r8
-    je fail_token_noopen
+    je panic_token_noopen
 
     # runtime fall-through leaves region
     lea rax, [rip + internal_ctrl_pop]
@@ -1257,7 +1266,7 @@ word_dup:
 word_drop:
     lea rax, [rip + data_stack]
     cmp r15, rax
-    je fail_stack_underflow
+    je panic_stack_underflow
     sub r15, 8
     mov r13, [r15]
     ret
@@ -1315,7 +1324,7 @@ word_exec:
 
     lea rcx, [rip + scope_stack_end]
     cmp rbx, rcx
-    jae fail_stack_overflow
+    jae panic_stack_overflow
 
     mov rdx, rbp
     or rdx, SCOPE_COMPILE_TAG
@@ -1412,7 +1421,7 @@ word_write:
 word_div:
     mov rcx, r13 # divisor = rhs TOS
     test rcx, rcx
-    jz fail_div_zero
+    jz panic_div_zero
     sub r15, 8
     mov rax, [r15] # dividend = lhs
     cqo
@@ -1423,7 +1432,7 @@ word_div:
 word_tick:
     call read_token
     call find_scope
-    jc fail_notfound
+    jc panic_dict_notfound
 
     mov [r15], r13 # old TOS = NOS
     add r15, 8
@@ -1445,7 +1454,7 @@ word_lit:
 # Emits TOS as a runtime literal into the active compile target (word)
 word_compile_lit:
     call scope_compile_target
-    jc fail_state
+    jc panic_state
 
     # rax = definition being compiled
     mov rcx, [rax + NODE_END]
@@ -1472,7 +1481,7 @@ word_native:
 word_ctrl_push:
     lea rcx, [rip + scope_stack_end]
     cmp rbx, rcx
-    jae fail_stack_overflow
+    jae panic_stack_overflow
 
     mov rax, [r12]
     add r12, 8
@@ -1499,7 +1508,7 @@ word_ctrl_pop:
 word_loop:
     lea rcx, [rip + scope_stack]
     cmp rbx, rcx
-    je fail_token_noopen
+    je panic_token_noopen
 
     # peek start offset
     mov eax, dword ptr [rbx - 8]
@@ -1511,7 +1520,7 @@ word_loop:
 
 word_break:
     call word_ctrl_pop
-    jc fail_token_noopen
+    jc panic_token_noopen
 
     # popped frame: end offset
     shr rax, 32
@@ -1520,6 +1529,14 @@ word_break:
     lea rcx, [rbp + NODE_BODY]
     lea r12, [rcx + rax]
     ret
+
+# TOS = node address
+word_jump:
+    mov rax, r13
+    sub r15, 8
+    mov r13, [r15]
+    mov rdx, [rax + NODE_CODE]
+    jmp rdx
 
 word_sys:
     mov rax, [rip + reg_data + 0*8]
@@ -1531,6 +1548,12 @@ word_sys:
     mov r9,  [rip + reg_data + 6*8]
     syscall
     mov [rip + reg_data + 0*8], rax
+    ret
+
+word_panic:
+    mov [r15], r13
+    add r15, 8
+    lea r13, [rip + panic_handler]
     ret
 
 word_load:
@@ -1547,12 +1570,12 @@ word_store:
 
 word_branch:
     cmp qword ptr [rip + state], STATE_DEF
-    jne fail_state
+    jne panic_state
 
     # ? consumes one named word for arm
     call read_token
     call find_scope
-    jc fail_notfound
+    jc panic_dict_notfound
 
     mov rdx, rax # arm cell
 
@@ -1626,7 +1649,7 @@ word_shr:
 
 word_immediate:
     cmp qword ptr [rip + state], STATE_DEF
-    jne fail_state
+    jne panic_state
     or qword ptr [rbp + NODE_TYPE], NODE_IMMEDIATE_MASK
     ret
 
@@ -1634,11 +1657,11 @@ word_immediate:
 # Immediate: Consumes all words in the scope
 word_asm:
     cmp qword ptr [rip + state], STATE_DEF
-    jne fail_state
+    jne panic_state
 
     lea rcx, [rip + scope_stack]
     cmp rbx, rcx
-    je fail_token_noopen
+    je panic_token_noopen
 
     # top scope entry is current scope
     mov rax, [rbx - 8]
@@ -1658,21 +1681,21 @@ word_asm:
 .asm_next:
     cmp r8, r9
     je .asm_ret
-    ja fail_token_invalid
+    ja panic_token_invalid
 
     # validate: either lit or qword value
     cmp qword ptr [r8], rdx
-    jne fail_token_invalid
+    jne panic_token_invalid
 
     # must be a byte
     mov rax, [r8 + 8]
     cmp rax, 255
-    ja fail_token_invalid
+    ja panic_token_invalid
 
     lea rcx, [rip + native_buf_end]
     cmp r11, rcx
     # TODO: Better error
-    jae fail_dict_overflow
+    jae panic_dict_overflow
 
     mov [r11], al
     inc r11
@@ -1684,7 +1707,7 @@ word_asm:
     # ret to threaded caller
     lea rcx, [rip + native_buf_end]
     cmp r11, rcx
-    jae fail_dict_overflow
+    jae panic_dict_overflow
 
     mov byte ptr [r11], 0xc3
     inc r11
@@ -1706,7 +1729,7 @@ word_asm:
 
 word_type:
     call scope_target
-    jc fail_state
+    jc panic_state
     call node_type
 
     mov [r15], r13
@@ -1733,7 +1756,7 @@ word_member_dispatch:
     # qualified member call: push context, run scope node, pop
     lea rcx, [rip + scope_stack_end]
     cmp rbx, rcx
-    jae fail_stack_overflow
+    jae panic_stack_overflow
 
     or rax, SCOPE_CONTEXT_TAG
     mov [rbx], rax
@@ -1780,7 +1803,7 @@ word_local_get:
     # find owning def
     and rax, -8
     call scope_invocation_frame
-    jc fail_local
+    jc panic_local
 
     mov rax, [rax]
 
@@ -1788,7 +1811,7 @@ word_local_get:
     mov ecx, r10d
     add rcx, 31
     bt rax, rcx
-    jnc fail_local
+    jnc panic_local
 
     # decode local base (where data stack should end up at end of execution)
     shr rax, 17
@@ -1814,7 +1837,7 @@ word_local_set:
     # find invocation frame for owner
     and rax, -8
     call scope_invocation_frame
-    jc fail_local
+    jc panic_local
 
     # preserve address of packed frame
     mov r11, rax
@@ -1842,21 +1865,21 @@ word_local_set:
 
 # Should not be executed at runtime, only compile time
 word_local:
-    jmp fail_compile_node
+    jmp panic_compile_node
 
 word_to:
     cmp qword ptr [rip + state], STATE_DEF
-    jne fail_state
+    jne panic_state
 
     # consume local (name)
     call read_token
     call find_scope
-    jc fail_notfound
+    jc panic_dict_notfound
 
     # validate it's a local
     lea rcx, [rip + word_local]
     cmp [rax + NODE_CODE], rcx
-    jne fail_token_invalid
+    jne panic_token_invalid
 
     # emit internal_local_set + owner|slot
     call node_local_binding
@@ -1912,7 +1935,7 @@ node_exec_set_code_start:
     shr rdx, 3
 
     cmp rdx, DICT_QWORDS - 1
-    ja fail_dict_overflow
+    ja panic_dict_overflow
 
     shl rdx, 36
     or [rcx], rdx
@@ -1953,7 +1976,7 @@ node_exec_enter:
 
     lea rcx, [rip + data_stack]
     cmp r10, rcx
-    jb fail_stack_underflow
+    jb panic_stack_underflow
 
     # rdx = local base
     lea rdx, [r10 + 8]
@@ -1963,11 +1986,11 @@ node_exec_enter:
 
     lea rcx, [rip + data_stack_end]
     cmp r9, rcx
-    ja fail_stack_overflow
+    ja panic_stack_overflow
 
     lea rcx, [rip + scope_stack_end]
     cmp rbx, rcx
-    jae fail_stack_overflow
+    jae panic_stack_overflow
 
     # owner occupies bits 3..16 as dictionary byte offset
     mov rax, rbp
@@ -2009,13 +2032,13 @@ node_exec_leave:
     # invocation frame must be on top
     lea rcx, [rip + scope_stack]
     cmp rbx, rcx
-    je fail_local
+    je panic_local
 
     sub rbx, 8
     mov rax, [rbx]
 
     test rax, rax
-    jns fail_local
+    jns panic_local
 
     # verify frame belongs to this definition
     mov rdx, rbp
@@ -2025,7 +2048,7 @@ node_exec_leave:
     mov ecx, eax
     and ecx, DICT_SIZE - 8
     cmp rcx, rdx
-    jne fail_local
+    jne panic_local
 
     # r8 = local base
     mov r8, rax
@@ -2042,7 +2065,7 @@ node_exec_leave:
     lea rcx, [r8 + rcx * 8]
 
     cmp r15, rcx
-    jb fail_local
+    jb panic_local
 
     # r9 = validity mask
     mov r9, rax
@@ -2071,7 +2094,7 @@ node_exec_leave:
     and edx, 7
 
     bt r9, rdx
-    jnc fail_local
+    jnc panic_local
 
     push qword ptr [r8 + rdx * 8]
 
@@ -2287,72 +2310,57 @@ scope_compile_target:
 #   CF = 0 found
 #   CF = 1 not found
 find_scope:
+    push rdi
+
     cmp qword ptr [rip + state], STATE_DEF
     jne .find_scope_root
 
-    mov r11, rbx
-
-    # current word is static
+    # current scope including type inheritance
     mov r8, rbp
-    call find_node
+    call find_member
     jnc .find_scope_static
 
-# find immediate defining scope
+    # parents
+    mov rdi, rbx
+
 .find_scope_parent:
     lea rcx, [rip + scope_stack]
-    cmp r11, rcx
+    cmp rdi, rcx
     je .find_scope_root
 
-    sub r11, 8
-    mov rax, [r11]
-
+    sub rdi, 8
+    mov rax, [rdi]
     test rax, SCOPE_PARENT_TAG
     jz .find_scope_parent
 
     and rax, -8
     mov r8, rax
+    call find_member
+    jc .find_scope_parent
 
-    # works in immediate parent remain overrideable
-    # a local is always the exact local node
-    call find_node
-    jc .find_scope_outer
-
+    # parent locals remain static
     lea rdx, [rip + word_local]
     cmp [rax + NODE_CODE], rdx
     je .find_scope_static
-    jmp .find_scope_virtual
 
-    # anything further out is normal lookup
-.find_scope_outer:
-    lea rcx, [rip + scope_stack]
-    cmp r11, rcx
-    je .find_scope_root
-
-    sub r11, 8
-    mov rax, [r11]
-
-    test rax, SCOPE_PARENT_TAG
-    jz .find_scope_outer
-
-    and rax, -8
-    mov r8, rax
-
-    call find_node
-    jc .find_scope_outer
-
-.find_scope_static:
-    mov r10d, 0
-    clc
-    ret
 .find_scope_virtual:
     mov r10d, 1
     clc
-    ret
+    jmp .find_scope_done
+
+.find_scope_static:
+    xor r10d, r10d
+    # clears CF
+    jmp .find_scope_done
+
 .find_scope_root:
+    mov r10d, r10d
     mov rdx, r14
     call find_dict
-    # preserve CF from find_dict
-    mov r10d, 0
+    # CF set
+
+.find_scope_done:
+    pop rdi
     ret
 
 # rsi = name address
@@ -2424,14 +2432,14 @@ eval_token:
     call find_scope
     pop r9
     pop rsi
-    jc fail_notfound
+    jc panic_dict_notfound
 
     # resolve member through context chain
     mov r8, rax
     push r8
     call find_member
     pop r8
-    jc fail_notfound
+    jc panic_dict_notfound
 
     # rax = resolved member
     # r8 = original context node
@@ -2500,7 +2508,7 @@ eval_token:
     # EXE: establish x as the active context, run scope node, restore
     lea rcx, [rip + scope_stack_end]
     cmp rbx, rcx
-    jae fail_stack_overflow
+    jae panic_stack_overflow
 
     or r8, SCOPE_CONTEXT_TAG
     mov [rbx], r8
@@ -2522,7 +2530,7 @@ eval_token:
 
     # exe: parse and push literal
     call parse_literal
-    jc fail_notfound
+    jc panic_dict_notfound
 
     mov [r15], r13
     add r15, 8
@@ -2531,11 +2539,11 @@ eval_token:
 
 .eval_declaration:
     call parse_declaration
-    jc fail_notfound
+    jc panic_dict_notfound
 
     # declaration must be typed
     test rax, rax
-    jz fail_token_invalid
+    jz panic_token_invalid
 
     call resolve_declaration_type
     # rdx = type node
@@ -2564,7 +2572,7 @@ eval_token:
     # push constructor target
     lea rcx, [rip + scope_stack_end]
     cmp rbx, rcx
-    jae fail_stack_overflow
+    jae panic_stack_overflow
 
     mov rax, rbp
     or rax, SCOPE_CONTEXT_TAG
@@ -2680,11 +2688,17 @@ _start:
     lea rsi, [rip + token_break]
     lea rdi, [rip + word_break]
     call dict_add_z
+    lea rsi, [rip + token_jump]
+    lea rdi, [rip + word_jump]
+    call dict_add_z
     lea rsi, [rip + token_type]
     lea rdi, [rip + word_type]
     call dict_add_z
     lea rsi, [rip + token_lit]
     lea rdi, [rip + word_compile_lit]
+    call dict_add_z
+    lea rsi, [rip + token_panic]
+    lea rdi, [rip + word_panic]
     call dict_add_z
 
     # immediates
@@ -2718,64 +2732,44 @@ _start:
     call dict_add_z
     or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
-    
-
 .repl_loop:
     call read_token
     call eval_token
     jmp .repl_loop
 
-fail_notfound:
-    mov rax, E_DIC
-    lea rsi, [rip + err_dict_notfound]
-    jmp fail_token
-fail_dict_overflow:
-    mov rax, E_DIC
-    lea rsi, [rip + err_dict_overflow]
-    jmp fail_token
-fail_div_zero:
-    mov rax, E_DIV
-    lea rsi, [rip + err_div_zero]
-    jmp fail_token
-fail_stack_underflow:
-    mov ax, E_STA
-    lea rsi, [rip + err_stack_underflow]
-    jmp fail_token
-fail_stack_overflow:
-    mov ax, E_STA
-    lea rsi, [rip + err_stack_overflow]
-    jmp fail_token
-fail_token_eof:
-    cmp qword ptr [rip + state], STATE_DEF
-    je fail_token_noclose
-    xor edi, edi
-    jmp exit
-fail_token_invalid:
-    mov rax, E_SYN
-    lea rsi, [rip + err_token_invalid]
-    jmp fail_token
-fail_token_overflow:
-    mov rax, E_LEN
-    lea rsi, [rip + err_token_len]
-    jmp fail_token
-fail_token_noclose:
-    mov rax, E_SYN
-    lea rsi, [rip + err_token_noclose]
-    jmp fail_token
-fail_token_noopen:
-    mov rax, E_SYN
-    lea rsi, [rip + err_token_noopen]
-    jmp fail_token
-fail_compile_node:
-    mov rax, E_SYN
-    lea rsi, [rip + err_compile_node]
-    jmp fail_token
-fail_state:
-    mov rax, E_SYN
-    lea rsi, [rip + err_state]
-    jmp fail_token
-fail_local:
-    mov rax, E_STA
-    lea rsi, [rip + err_state_local]
-    jmp fail_token
-        
+panic_dict_notfound:
+    mov eax, P_DICT_NOTFOUND
+    jmp panic
+panic_dict_overflow:
+    mov eax, P_DICT_OVERFLOW
+    jmp panic
+ panic_stack_overflow:
+    mov eax, P_STACK_OVERFLOW
+    jmp panic
+panic_stack_underflow:
+    mov eax, P_STACK_UNDERFLOW
+    jmp panic
+panic_token_invalid:
+    mov eax, P_TOKEN_INVALID
+    jmp panic
+panic_token_overflow:
+    mov rax, P_TOKEN_OVERFLOW
+    jmp panic
+panic_token_noclose:
+    mov rax, P_TOKEN_NOCLOSE
+    jmp panic
+panic_token_noopen:
+    mov rax, P_TOKEN_NOOPEN
+    jmp panic
+panic_compile_node:
+    mov rax, P_COMPILE_NODE
+    jmp panic
+panic_state:
+    mov rax, P_STATE
+    jmp panic
+panic_local:
+    mov rax, P_LOCAL
+    jmp panic
+panic_div_zero:
+    mov rax, P_DIV_ZERO
+    jmp panic

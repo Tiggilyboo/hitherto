@@ -185,5 +185,69 @@
     ]
 ]
 
-# must end on newline
+[ :debugger ( :frame -- )
+    [ :emit ( :c -- )
+        c $7 !
+        1 $0 !
+        1 $1 !
+        $7 $2 !
+        1 $3 !
+        sys
+    ]
+    [ :name ( :node -- )
+        1 $0 !
+        1 $1 !
+        node 32 + $2 !
+        node 24 + @ 32 >> 8 - $3 !
+        sys
+        10 emit
+    ]
+    [ :addr ' lit immediate ]
+    [ :state ]
+    [ :dictionary-not-found ]
+    [ :dictionary-overflow ]
+    [ :stack-underflow ]
+    [ :stack-overflow ]
+    [ :token-invalid ]
+    [ :token-overflow ]
+    [ :token-not-closed ]
+    [ :token-not-open ]
+    [ :compile-node ]
+    [ :division-by-zero ]
+    [ :invalid-local ]
+    
+    [ :debug-state addr state name ]
+    [ :debug-dictionary-not-found addr dictionary-not-found name ]
+    [ :debug-dictionary-overflow addr dictionary-overflow name ]
+    [ :debug-stack-underflow addr stack-underflow name ]
+    [ :debug-stack-overflow addr stack-overflow name ]
+    [ :debug-token-invalid addr token-invalid name ]
+    [ :debug-token-overflow addr token-overflow name ]
+    [ :debug-token-not-closed addr token-not-closed name ]
+    [ :debug-token-not-open addr token-not-open name ]
+    [ :debug-compile-node addr compile-node name ]
+    [ :debug-division-by-zero addr division-by-zero name ]
+    [ :debug-invalid-local addr invalid-local name ]
 
+    frame @
+    ^ 1 = ? debug-state
+    ^ 2 = ? debug-dictionary-not-found
+    ^ 3 = ? debug-dictionary-overflow
+    ^ 4 = ? debug-stack-underflow
+    ^ 5 = ? debug-stack-overflow
+    ^ 6 = ? debug-token-invalid
+    ^ 7 = ? debug-token-overflow
+    ^ 8 = ? debug-token-not-closed
+    ^ 9 = ? debug-token-not-open
+    ^ 10 = ? debug-compile-node
+    ^ 11 = ? debug-division-by-zero
+    ^ 12 = ? debug-invalid-local
+    .
+]
+# register it
+' debugger panic !
+
+# underflow test
+_
+
+# must end on newline
