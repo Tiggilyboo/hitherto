@@ -10,6 +10,8 @@
 .equ DICT_SIZE, 131072
 .equ DICT_QWORDS, DICT_SIZE / 8
 
+.equ CORE_QWORDS, (core_end - core) / 8
+
 .equ STATE_EXE, 0
 .equ STATE_DEF, 1
 
@@ -87,6 +89,8 @@ token_break:
     .asciz "~]"
 token_jump:
     .asciz "~_"
+token_core_ref:
+    .asciz "$_"
 token_immediate:
     .asciz "immediate"
 token_asm:
@@ -125,15 +129,24 @@ internal_local_set:
 .section .bss
 
 .align 8
-state:
-    .quad 0
+
+# assembly host state exposed to language via TOS $_
+# Where TOS is the address offset from core .. core_end
+core:
 reg_data:
-    .skip 64
+    # host register bank: 0..31
+    .skip 32 * 8
 panic_handler:
     .quad 0
 io_data:
     .quad 0
 io_length:
+    .quad 0
+core_end:
+
+# private state not exposed to core
+.align 8
+state:
     .quad 0
 write_buf:
     .skip TOKEN_MAX_LEN
@@ -178,6 +191,7 @@ native_here:
 .equ P_COMPILE_NODE, 10
 .equ P_DIV_ZERO, 11
 .equ P_LOCAL, 12
+.equ P_EOF, 13
 
 .equ PANIC_CODE, 0
 .equ PANIC_STATE, 8
@@ -484,10 +498,10 @@ parse_literal:
     pop rsi
     jc .literal_bad
 
-    cmp rax, 7
+    cmp rax, 31
     ja .literal_bad
 
-    lea rcx, [rip + reg_data]
+    lea rcx, [rip + core]
     lea rax, [rcx + rax * 8]
 
     clc
@@ -1120,6 +1134,13 @@ compile_local:
 
 words:
 
+# TOS = P_* panic code
+word_panic:
+    mov rax, r13
+    sub r15, 8
+    mov r13, [r15]
+    jmp panic
+
 word_ctrl_open:
     cmp qword ptr [rip + state], STATE_DEF
     je .ctrl_open_nested
@@ -1550,10 +1571,13 @@ word_sys:
     mov [rip + reg_data + 0*8], rax
     ret
 
-word_panic:
-    mov [r15], r13
-    add r15, 8
-    lea r13, [rip + panic_handler]
+# TOS = qword slot within core
+word_core_ref:
+    cmp r13, CORE_QWORDS
+    jae panic_state
+
+    lea rax, [rip + core]
+    lea r13, [rax + r13 * 8]
     ret
 
 word_load:
@@ -2700,6 +2724,9 @@ _start:
     lea rsi, [rip + token_panic]
     lea rdi, [rip + word_panic]
     call dict_add_z
+    lea rsi, [rip + token_core_ref]
+    lea rdi, [rip + word_core_ref]
+    call dict_add_z
 
     # immediates
     lea rsi, [rip + token_ctrl_open]
@@ -2769,6 +2796,9 @@ panic_state:
     jmp panic
 panic_local:
     mov rax, P_LOCAL
+    jmp panic
+panic_eof:
+    mov rax, P_EOF
     jmp panic
 panic_div_zero:
     mov rax, P_DIV_ZERO
