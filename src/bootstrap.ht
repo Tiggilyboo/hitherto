@@ -1,9 +1,9 @@
 # words which point to internal core qword addresses in kernel
 [ :core
     # 0..31 can be accessed via $0..31 for register bank
-    [ :panic-handler 32 $_ ]
-    [ :io-data 33 $_ ]
-    [ :io-length 34 $_ ]
+    [ :panic-handler $32 ]
+    [ :io-data $33 ]
+    [ :io-length $34 ]
 ]
 
 [ :linux
@@ -63,8 +63,9 @@
     ]
 ]
 
-# standard types
+# standard numeric data types
 [ :u8
+    [ :& 0xff & ]
     [ :@
         [ 0x4d 0x0f 0xb6 0x6d 0x00 asm ]
     ]
@@ -76,28 +77,39 @@
         ]
         _ _
     ]
-    [ :&
-        0xff &
-    ]
+]
+[ :u32
+    [ :& 0xffffffff & ]
 ]
 
 [ :memory
     [ :ptr ]
     [ :len ]
-    [ :span ptr len ]
-]
-
-# str is a printable memory span (ie. the string type)
-[ memory:str
-    [ :ptr 8 + ]
-    [ :len @ ]
     [ :span
         ^ ptr
         >< len
     ]
+]
+
+# str is a printable memory span (ie. the string type)
+[ memory:str
+    [ :ptr
+        ^ @
+        u32~&
+        +
+    ]
+    [ :len
+        @
+        ^
+        32 >>
+        ><
+        u32~&
+        -
+    ]
     [ :.
         [ :write-err 1 linux~exit ]
         1 # stdout
+        ><
         span
         linux~write
         0 < ? write-err
@@ -129,7 +141,9 @@
     ]
     
     [ :read ( -- u8:v )
-        len @ 0 = ? refill
+        [
+            len @ 0 = ? refill
+        ]
 
         data @
         u8~& to v
@@ -219,7 +233,9 @@
     ]
     [ :done ( str:s u8:c -- )
         arena~cursor
-        s str~ptr -
+        s -
+        32 <<
+        8 |
         s !
 
         s lit
@@ -254,69 +270,143 @@
     immediate
 ]
 
-[ :debugger ( :f -- )
-    [ :frame
-        [ :code ]              # +0
-        [ :state 8 + ]         # +8
-        [ :definition 16 + ]   # +16 / saved rbp
-        [ :scope 24 + ]        # +24 / saved rbx
-        [ :instruction 32 + ]  # +32 / saved r12
-        [ :tos 40 + ]          # +40 / saved r13
-        [ :dictionary 48 + ]   # +48 / saved r14
-        [ :data-stack 56 + ]   # +56 / saved r15
-        [ :native-stack 64 + ] # +64 / saved rsp
+# kernel/core node format for internal representation of memory for a word
+[ :node
+    [ :code ( -- :v )
+        @
+        to v
+    ]
+    [ :type ( -- node:v )
+        8 +
+        @
+        -8 &
+        to v
+    ]
+    [ :end ( -- :v )
+        16 +
+        @
+        to v
+    ]
+    [ :body ( -- :v )
+        24 +
+        to v
+    ]
+    [ :name ( -- str:v )
+        body
+        to v
+    ]
+]
 
-        [ :code-desc ( -- str:v )
-            [ :panic-state "Invalid state" ]
-            [ :panic-dict-notfound "Key in dictionary not found" ]
-            [ :panic-dict-overflow "Dictionary overflow" ]
-            [ :panic-stack-underflow "Data stack underflow" ]
-            [ :panic-stack-overflow "Data stack overflow" ]
-            [ :panic-token-invalid "Invalid token" ]
-            [ :panic-token-overflow "Token too long" ]
-            [ :panic-token-noclose "Expected closing token" ]
-            [ :panic-token-noopen "Expected open token" ]
-            [ :panic-compile-node "Encountered a node which should only be compiled" ]
-            [ :panic-div-zero "Divide by zero" ]
-            [ :panic-local "Invalid local" ]
-            [ :panic-unhandled "Unhandled" ]
-
-            code @
-            [
-                ^ 1 = ? panic-state 
-                ^ 2 = ? panic-dict-notfound
-                ^ 3 = ? panic-dict-overflow
-                ^ 4 = ? panic-stack-underflow
-                ^ 5 = ? panic-stack-overflow
-                ^ 6 = ? panic-token-invalid
-                ^ 7 = ? panic-token-overflow
-                ^ 8 = ? panic-token-noclose
-                ^ 9 = ? panic-token-noopen
-                ^ 10 = ? panic-compile-node
-                ^ 11 = ? panic-div-zero
-                ^ 12 = ? panic-local
-                ? panic-unhandled
-            ]
-            to v
-        ]
+[ :frame
+    [ :code ( -- :v )
+        @
+        to v
     ]
 
-    "Panic code " str~.
+    [ :state ( -- :v )
+        8 +
+        @
+        to v
+    ]
+
+    [ :definition ( -- node:v )
+        16 +
+        @
+        to v
+    ]
+
+    [ :scope ( -- :v )
+        24 +
+        @
+        to v
+    ]
+
+    [ :instruction ( -- :v )
+        32 +
+        @
+        to v
+    ]
+
+    [ :tos ( -- :v )
+        40 +
+        @
+        to v
+    ]
+
+    [ :dictionary ( -- node:v )
+        48 +
+        @
+        to v
+    ]
+
+    [ :data-stack ( -- :v )
+        56 +
+        @
+        to v
+    ]
+
+    [ :native-stack ( -- :v )
+        64 +
+        @
+        to v
+    ]
+
+    [ :code-desc ( -- str:v )
+        [ :panic-state "Invalid state" ]
+        [ :panic-dict-notfound "Key in dictionary not found" ]
+        [ :panic-dict-overflow "Dictionary overflow" ]
+        [ :panic-stack-underflow "Data stack underflow" ]
+        [ :panic-stack-overflow "Data stack overflow" ]
+        [ :panic-token-invalid "Invalid token" ]
+        [ :panic-token-overflow "Token too long" ]
+        [ :panic-token-noclose "Expected closing token" ]
+        [ :panic-token-noopen "Expected open token" ]
+        [ :panic-compile-node "Encountered a node which should only be compiled" ]
+        [ :panic-div-zero "Divide by zero" ]
+        [ :panic-local "Invalid local" ]
+        [ :panic-unhandled "Unhandled" ]
+
+        code @
+        [
+            ^ 1 = ? panic-state 
+            ^ 2 = ? panic-dict-notfound
+            ^ 3 = ? panic-dict-overflow
+            ^ 4 = ? panic-stack-underflow
+            ^ 5 = ? panic-stack-overflow
+            ^ 6 = ? panic-token-invalid
+            ^ 7 = ? panic-token-overflow
+            ^ 8 = ? panic-token-noclose
+            ^ 9 = ? panic-token-noopen
+            ^ 10 = ? panic-compile-node
+            ^ 11 = ? panic-div-zero
+            ^ 12 = ? panic-local
+            ? panic-unhandled
+        ]
+        to v
+    ]
+]
+
+[ :debugger ( frame:f -- )
+    
+    "Panic: " str~.
     f frame~code-desc str~.
 
-    "State " str~.
+    "State: " str~.
     f frame~state @ .
 
-    "Definition " str~.
-    f frame~definition @ str~.
+    "Definition: " str~.
+    f frame~definition @ .
 
-    "Instruction " str~.
-    f frame~instruction @ str~.
+    "Instruction: " str~.
+    f frame~instruction @ .
 
-    "TOS " str~.
-    f frame~tos @ str~.
+    "TOS: " str~.
+    f frame~tos @ .
 ]
 
 ' debugger core~panic-handler !
+
+# test underflow handling
+_
 
 # must end on newline

@@ -89,8 +89,6 @@ token_break:
     .asciz "~]"
 token_jump:
     .asciz "~_"
-token_core_ref:
-    .asciz "$_"
 token_immediate:
     .asciz "immediate"
 token_asm:
@@ -130,8 +128,8 @@ internal_local_set:
 
 .align 8
 
-# assembly host state exposed to language via TOS $_
-# Where TOS is the address offset from core .. core_end
+# assembly host state exposed to language via TOS $[0-9]+
+# number is qword index (cell)
 core:
 reg_data:
     # host register bank: 0..31
@@ -265,9 +263,10 @@ read_char:
 
     pop rcx
 
-    # zero = EOF; negative syscall error currently behaves as EOF too
+    # zero = EOF, negative = error
     test rax, rax
-    jle .read_char_eof
+    js .read_char_error
+    jz .read_char_eof
 
     mov [rip + io_length], rax
 
@@ -279,6 +278,9 @@ read_char:
 
     clc
     ret
+.read_char_error:
+    mov rax, P_STATE
+    jmp panic
 
 .read_char_eof:
     stc
@@ -367,12 +369,15 @@ parse_int:
 # rsi = hex bytes
 # r9 = byte length
 # returns:
-#   rax = byte value
+#   rax = unsigned qword
 #   CF = 0 success
 #   CF = 1 invalid
-parse_hex_byte:
-    cmp r9, 2
+parse_hex:
+    cmp r9, r9
     jne .hex_invalid
+
+    cmp r9, 16
+    ja .hex_invalid
 
     xor eax, eax
     xor ecx, ecx
@@ -402,9 +407,9 @@ parse_hex_byte:
     sub dl, '0'
 
 .hex_append:
-    shl eax, 4
+    shl rax, 4
     movzx edx, dl
-    or eax, edx
+    or rax, rdx
 
     inc rcx
     jmp .hex_next
@@ -482,6 +487,7 @@ parse_literal:
     test r9, r9
     jz .literal_bad
 
+    # '$' prefix for core address?
     cmp byte ptr [rsi], '$'
     jne .literal_number
 
@@ -498,8 +504,8 @@ parse_literal:
     pop rsi
     jc .literal_bad
 
-    cmp rax, 31
-    ja .literal_bad
+    cmp rax, OFFSET CORE_QWORDS
+    jae .literal_bad
 
     lea rcx, [rip + core]
     lea rax, [rcx + rax * 8]
@@ -521,7 +527,7 @@ parse_literal:
     push r9
     add rsi, 2
     sub r9, 2
-    call parse_hex_byte
+    call parse_hex
     pop r9
     pop rsi
     ret
@@ -539,7 +545,7 @@ read_token:
     xor rcx, rcx
 .skip_ws:
     call read_char
-    jc panic_token_noclose
+    jc .token_eof
 
     cmp al, ' ' 
     je .skip_ws
@@ -557,7 +563,7 @@ read_token:
 
 .skip_comment:
     call read_char
-    jc panic_token_noclose
+    jc .token_eof
     cmp al, '\n'
     jne .skip_comment
     jmp .skip_ws
@@ -590,6 +596,10 @@ read_token:
     mov [rip + token_len], rcx
     mov r9, rcx
     xor eax, eax
+    clc
+    ret
+.token_eof:
+    stc
     ret
 
 # rsi = declaration bytes
@@ -979,6 +989,8 @@ compile_signature:
 
 .signature_inputs:
     call read_token
+    jc panic_token_noclose
+
     # '--' switch to outputs
     cmp r9, 2
     jne .signature_input
@@ -998,6 +1010,8 @@ compile_signature:
 
 .signature_outputs:
     call read_token
+    jc panic_token_noclose
+
     # ')' ends signature
     cmp r9, 1
     jne .signature_output
@@ -1050,6 +1064,7 @@ compile_signature:
 # STATE_DEF is active
 compile_definition_open:
     call read_token
+    jc panic_token_noclose
 
     # Optional signature starts with '('.
     cmp r9, 1
@@ -1152,6 +1167,8 @@ word_ctrl_open:
     jne panic_state
 
     call read_token
+    jc panic_token_noclose
+
     call parse_declaration
     jc panic_token_invalid
 
@@ -1179,6 +1196,8 @@ word_ctrl_open:
 .ctrl_open_nested:
     # next token figures out : anonymous control region or scoped def
     call read_token
+    jc panic_token_noclose
+
     call parse_declaration
     jc .ctrl_open_anonymous
 
@@ -1452,6 +1471,8 @@ word_div:
 
 word_tick:
     call read_token
+    jc panic_token_noclose
+
     call find_scope
     jc panic_dict_notfound
 
@@ -1571,15 +1592,6 @@ word_sys:
     mov [rip + reg_data + 0*8], rax
     ret
 
-# TOS = qword slot within core
-word_core_ref:
-    cmp r13, CORE_QWORDS
-    jae panic_state
-
-    lea rax, [rip + core]
-    lea r13, [rax + r13 * 8]
-    ret
-
 word_load:
     mov r13, [r13]
     ret
@@ -1598,6 +1610,8 @@ word_branch:
 
     # ? consumes one named word for arm
     call read_token
+    jc panic_token_noclose
+
     call find_scope
     jc panic_dict_notfound
 
@@ -1897,6 +1911,8 @@ word_to:
 
     # consume local (name)
     call read_token
+    jc panic_token_noclose
+
     call find_scope
     jc panic_dict_notfound
 
@@ -2378,9 +2394,9 @@ find_scope:
     jmp .find_scope_done
 
 .find_scope_root:
-    mov r10d, r10d
     mov rdx, r14
     call find_dict
+    mov r10d, 0 # find_dict clobbers r10
     # CF set
 
 .find_scope_done:
@@ -2724,9 +2740,6 @@ _start:
     lea rsi, [rip + token_panic]
     lea rdi, [rip + word_panic]
     call dict_add_z
-    lea rsi, [rip + token_core_ref]
-    lea rdi, [rip + word_core_ref]
-    call dict_add_z
 
     # immediates
     lea rsi, [rip + token_ctrl_open]
@@ -2761,8 +2774,13 @@ _start:
 
 .repl_loop:
     call read_token
+    jc .repl_eof
     call eval_token
     jmp .repl_loop
+.repl_eof:
+    xor edi, edi
+    mov rax, 60
+    syscall
 
 panic_dict_notfound:
     mov eax, P_DICT_NOTFOUND
