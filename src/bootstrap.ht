@@ -206,9 +206,7 @@
         used
     ]
     [ :alloc
-        [ :overflow
-            1 linux~exit
-        ]
+        [ :overflow 3 panic ]
         cursor ><
 
         # preserve cursor and increment

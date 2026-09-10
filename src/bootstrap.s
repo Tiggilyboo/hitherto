@@ -101,6 +101,8 @@ token_to:
     .asciz "to"
 token_panic:
     .asciz "panic"
+token_self:
+    .asciz "self"
 token_newline:
     .asciz "\n"
 
@@ -661,6 +663,22 @@ resolve_declaration_type:
     xor edx, edx
 
     test rax, rax
+    jz .resolve_try_self
+
+.resolve_try_self:
+    cmp r8, 4
+    jne .resolve_not_self
+
+    mov ecx, dword ptr [rip + token_self]
+    cmp dword ptr [rax], ecx
+    jne .resolve_not_self
+
+    # self = rbp 
+    mov rdx, rbp
+    jmp .resolve_decl_done
+
+.resolve_not_self:
+    test rax, rax
     jz .resolve_decl_done
 
     push rsi
@@ -1063,9 +1081,25 @@ compile_signature:
 # r12 = first free qword after zeroed signature header
 # STATE_DEF is active
 compile_definition_open:
+.definition_field_layout_next:
     call read_token
     jc panic_token_noclose
 
+    # Optional field layout has 'type:name'
+    call parse_declaration
+    jc .definition_signature
+
+    # rax, r8 = type address, type len
+    # rsi, r9 = name address, name len
+    # field must have defined type
+    cmp rax, 0
+    jz panic_token_invalid
+
+    # TODO
+
+    jmp .definition_field_layout_next
+
+.definition_signature:
     # Optional signature starts with '('.
     cmp r9, 1
     jne .definition_body

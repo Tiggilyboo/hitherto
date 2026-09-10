@@ -4,17 +4,18 @@
 
 Keep the feature inside Hitherto's existing mechanisms:
 
-- definitions are callable words and namespaces;
+- definitions remain callable words and namespaces;
 - `type:name` remains the declaration form;
-- signatures define all stack consumption/output;
-- no hidden receiver, receiver register, receiver flag, or signature prefix;
+- signatures remain the only stack/invocation contract;
+- `self` is only a lexical type alias;
+- there is no hidden receiver, receiver register, receiver flag, or signature prefix;
 - `immediate` remains compile-time execution only;
-- packed layout metadata is represented by ordinary child nodes;
+- fields are ordinary generated child words, not a parallel runtime object system;
 - leaf packed width comes from an immediate `mask` member;
-- composite width is derived from declared fields;
-- runtime values remain untagged qwords; type checking is a compiler concern.
+- composite width is derived from fields;
+- runtime values remain untagged qwords; type checking belongs in the compiler.
 
-Working example:
+Working shape:
 
 ```forth
 [ :u8
@@ -54,7 +55,7 @@ Working example:
 
 ## 2. Signature semantics
 
-Signatures remain the only invocation contract.
+Signatures remain unchanged.
 
 ```forth
 ( self:v -- v )
@@ -63,45 +64,30 @@ Signatures remain the only invocation contract.
 means:
 
 - consume one qword into local `v`;
-- `v` is typed as the lexical owning type;
-- reuse local `v` as the output;
-- effective stack effect is `self -> self`.
+- type `v` as the lexical owning type;
+- reuse the same local as the output;
+- effective stack effect: `self -> self`.
 
-There is no special preservation mechanism. If an input survives a call, it must appear in the outputs.
+If an input survives a call, it must appear in the outputs. There is no receiver preservation mechanism.
 
-Output ordering remains meaningful. For example:
-
-```forth
-( self:v -- v u8:x )
-```
-
-means `self -> self u8`.
-
-The existing signed invocation machinery already supports input locals, reused output locals, staging outputs, reclaiming consumed inputs, and emitting outputs. Do not extend the signature header with receiver metadata.
+Existing signed invocation already provides input locals, output-local reuse, validity tracking, caller-stack reclamation, and ordered output emission. Do not extend the signature header for this feature.
 
 ## 3. `self`
 
-`self` is only a lexical type alias used in `type:name` declarations.
+`self` is only a lexical type alias in a `type:name` declaration.
 
-It is not:
+It is not a value, receiver, signature mode, or scope-context pointer.
 
-- a value;
-- a hidden receiver;
-- an unnamed signature item;
-- a runtime context pointer.
+Initial resolution:
 
-Initial resolution rule:
+- in a definition's own constructor, `self` resolves to that definition;
+- in a direct nested member, `self` resolves to the enclosing definition.
 
-- in a type's own top-level constructor, `self` resolves to that definition;
-- in a nested member, `self` resolves to the owning/enclosing type definition.
+Implement this only in `resolve_declaration_type`. Do not make unfinished definitions ordinarily name-resolvable just to support self-reference.
 
-Keep self-resolution isolated in `resolve_declaration_type`; do not expose unfinished definitions through ordinary word lookup merely to support `self`.
+## 4. Definition preamble
 
-Nested type definitions are an edge case until type-vs-member ownership is formalized; do not broaden `self` semantics implicitly.
-
-## 4. Definition preamble and fields
-
-Leading typed declarations before the signature are persistent layout fields:
+Leading typed declarations before the optional signature are layout fields:
 
 ```forth
 [ :header
@@ -110,58 +96,79 @@ Leading typed declarations before the signature are persistent layout fields:
     u8:c
 
     ( -- )
-    ... executable body ...
+    ... body ...
 ]
 ```
 
-Meaning:
-
-- `a`, `b`, `c` are child field nodes of `header`;
-- they are not invocation locals;
-- they are not executed when `header` is invoked;
-- the signature begins the callable portion of the definition.
-
 Declarations inside `( ... )` remain invocation locals.
 
-Once executable code begins, existing body declaration behavior remains unchanged.
+Refactor `compile_definition_open` into a small preamble loop:
 
-Because a leading `type:name` is now a field, a definition whose executable body intentionally begins with a typed child declaration must use an explicit `( -- )` boundary.
+1. read a token;
+2. leading `type:name` -> compile a field, advance layout cursor, continue;
+3. `(` -> use existing `compile_signature`, then establish `code_start` and body control;
+4. anything else -> establish `code_start` and process it with the existing body path;
+5. `]` after fields -> finalize an empty executable body normally.
 
-Refactor `compile_definition_open` into a preamble loop:
+This keeps fields physically before `code_start`, like signature-local metadata, so invoking the owner never executes field declarations.
 
-1. read the next token;
-2. `type:name` -> compile a field and continue the preamble;
-3. `(` -> compile signature, set code start, open executable control region;
-4. anything else -> set code start, open executable control region, evaluate that token;
-5. `]` after fields -> establish an empty executable body and close normally.
+Do not move `NODE_BODY` and do not add `NODE_SIZE`.
 
-Do not move `NODE_BODY` or add `NODE_SIZE`.
+## 5. Fields are generated ordinary child words
 
-## 5. Field node representation
+Do not add `word_field` or a field-specific runtime evaluator.
 
-Fields are ordinary child nodes with a distinct code kind, e.g. `word_field`.
-
-Minimum field state:
+A field is an ordinary `word_exec` child generated by the compiler from existing operations. Mark it only so layout reflection can distinguish fields from ordinary nested members:
 
 ```text
-NODE_CODE = word_field
-NODE_TYPE = declared field type
-payload:
-    packed bit offset
-    packed bit width or extraction mask
+NODE_CODE = word_exec
+NODE_TYPE = declared field type | NODE_FIELD_MASK
 ```
 
-The exact payload packing can be chosen for the smallest representation; it does not require a fixed node-header field.
+Use one currently-free low NODE_TYPE flag bit for `NODE_FIELD_MASK`; `node_type` continues masking flags normally.
 
-`compile_field` should mirror the publication pattern of `compile_local`, but fields are persistent public members rather than invocation-frame locals.
+No field offset/width payload is required initially. Offset is needed while generating the accessor; later composite measurement can walk direct children marked as fields and recursively measure their types.
 
-Fields are densely packed in declaration order. There is no implicit alignment or padding.
+Field nodes are public members. Signature locals remain invocation-only bindings.
 
-## 6. Packed width and `mask`
+## 6. Reuse existing child/signature compilation
 
-Do not add `size`, `mask` metadata fields, or magic inspection of `&` implementation code.
+Factor child creation/publication rather than duplicating `node_add` and node-finalization logic.
 
-A leaf scalar type exposes its maximum packed value through an immediate member named `mask`:
+Conceptually split current child compilation into reusable pieces:
+
+```text
+compile_child_create
+compile_child_publish
+```
+
+Ordinary nested definitions:
+
+```text
+emit internal_skip
+create child
+compile body
+publish child
+```
+
+Preamble fields:
+
+```text
+create child without parent internal_skip
+mark NODE_FIELD_MASK
+build normal signature/body
+publish child
+```
+
+No skip is needed because the field node is physically before the owner's `code_start`.
+
+Build generated field bodies using existing signature helpers, local nodes, threaded calls, literals, shifts, arithmetic, qualified member calls, and `to`/local-set behavior. Do not duplicate those operations in new field-specific assembly.
+
+## 7. `mask` compile-time property
+
+Do not add size/mask metadata slots and do not inspect the implementation of `&`.
+
+A leaf packed type exposes width through an ordinary immediate member named `mask`:
 
 ```forth
 [ :u8
@@ -173,13 +180,13 @@ A leaf scalar type exposes its maximum packed value through an immediate member 
 ]
 ```
 
-Rules for a layout-capable leaf `mask`:
+Layout-query rules:
 
 - member name is `mask`;
-- it must be immediate;
-- signature must consume zero inputs and produce exactly one output;
-- it must return a non-zero contiguous low-bit mask (`2^n - 1`);
-- it must not emit runtime code while being queried by the layout compiler.
+- it is immediate;
+- signature is zero inputs, exactly one output;
+- returned value is a non-zero contiguous low-bit mask (`2^n - 1`);
+- no runtime code may be emitted while the compiler queries it.
 
 Examples:
 
@@ -188,115 +195,107 @@ u8~mask  -> 0xff    -> width 8
 u16~mask -> 0xffff  -> width 16
 ```
 
-Derived scalar types inherit `mask` through the existing `NODE_TYPE` member lookup chain.
+Derived scalar types may inherit `mask` through the existing `NODE_TYPE` member chain.
 
-Composite width is not queried through a synthetic `mask`. It is derived by summing its direct field widths. This recursively solves nested composites without a `NODE_SIZE` field.
+Do not put `lit` inside `mask`; a property query returns a compile-time value. Emission is the caller's separate decision.
 
-## 7. Isolated compile-time property evaluation
+## 8. Reuse `word_exec` for isolated property queries
 
-Normal `immediate` semantics execute against the compiler-time data stack and may emit into the active compile target. Layout queries must be stricter.
-
-Add one internal helper for compile-time property evaluation, conceptually:
+Add one narrow compiler helper, not a second evaluator:
 
 ```text
-query_immediate_value(type, "mask") -> qword
+query_immediate_value(type, member-name) -> qword
 ```
 
-It must:
+It should:
 
-1. resolve the member through normal type inheritance;
+1. resolve the member using existing member/inheritance lookup;
 2. require `NODE_IMMEDIATE_MASK`;
-3. inspect/validate the zero-input, one-output signature;
-4. execute the word with no usable runtime-code emission target;
-5. obtain exactly one resulting value;
-6. restore compiler stack/state completely;
-7. reject missing members, malformed signatures, stack imbalance, or attempted code emission.
+3. validate the existing signature header as zero-input/one-output;
+4. save compiler state, scope stack, TOS/data-stack position, `rbp`, and `r12`;
+5. run the member through its existing `NODE_CODE`/`word_exec` path in isolated execution state with no compile target;
+6. require exactly one result;
+7. capture the result and restore all surrounding compiler state;
+8. reject stack imbalance, malformed signature, missing member, or attempted code emission.
 
-Prefer executing the property in an isolated `STATE_EXE`-style context while preserving the surrounding `STATE_DEF`, `rbp`, `r12`, `rbx`, and data-stack state. This naturally makes `lit`/compile-target emission invalid during a property query.
+The helper exists only to isolate and validate an ordinary immediate word.
 
-Do not put `lit` inside `mask`. A source-level immediate may still explicitly use `mask` plus `lit` when the programmer intentionally wants to emit the constant.
+## 9. Layout measurement
 
-## 8. Member lookup: locals are not public members
+Fields are densely packed in declaration order. No implicit alignment or padding.
 
-Current direct member lookup shares the same child/local dictionary and can expose `word_local` nodes through `find_member`.
+For each field type:
 
-Split lookup semantics without splitting physical storage:
+- if it has direct layout fields, recursively sum those field widths;
+- otherwise resolve/inherit `mask` and derive width from its contiguous low bits.
 
-- lexical lookup may find signature locals;
-- public/member lookup must skip `NODE_CODE == word_local`;
-- fields and nested words remain public members;
-- inherited member lookup continues through `NODE_TYPE`.
-
-Recommended helpers:
-
-```text
-find_local(node, name)          # direct word_local only
-find_direct_member(node, name)  # direct non-local children
-find_member(node, name)         # direct member + NODE_TYPE chain
-```
-
-Update `find_scope` so current/parent locals keep their existing lexical precedence, while `scope~member` cannot expose invocation locals.
-
-## 9. Typed-local member access
-
-Implement the intended meaning of:
+Example:
 
 ```forth
-v~x
+[ :something
+    u8:x
+    u8:y
+    u16:z
+]
 ```
 
-when `v` resolves to `word_local`:
-
-1. emit `internal_local_get` for `v`;
-2. obtain `NODE_TYPE(v)`;
-3. resolve `x` through that type's member chain;
-4. emit the resolved field/member call normally.
-
-Do not use the local node as `SCOPE_CONTEXT_TAG`; that context is dictionary dispatch state, not a runtime receiver.
-
-There is no runtime value-based dynamic dispatch because values carry no runtime type tag. Dispatch from a typed local is statically determined by its declared type.
-
-For an untyped value, explicit qualification remains valid:
-
-```forth
-value something~x
-```
-
-The member operation consumes/uses the actual data-stack value according to its implementation/signature.
-
-## 10. Field execution
-
-A field is a real stack operation; it has no hidden receiver.
-
-For a packed scalar owner:
+becomes:
 
 ```text
-owner-value -> field-value
+x: bit offset 0,  width 8
+y: bit offset 8,  width 8
+z: bit offset 16, width 16
+total width 32
 ```
 
-Implementation:
+The current layout cursor is compile-time state only; it is not stored in each field node.
 
-```text
-(field = value >> bit_offset) & field_mask
-```
+Initial limits:
 
-The original value is consumed unless the caller explicitly preserved or stored it elsewhere.
+- value-backed packed values must fit in one qword (total width <= 64 bits);
+- address-backed layouts may exceed 64 bits because the qword represents an address;
+- reject recursive-by-value layouts and any cycle that prevents finite measurement.
 
-This matches typed locals naturally:
+## 10. Generated packed-value field accessors
+
+For a value-backed owner, generate an ordinary consuming accessor.
+
+Conceptually:
 
 ```forth
-v~x
+# x at bit offset 0
+[ :x ( self:v -- u8:o )
+    v
+    u8~&
+    to o
+]
+
+# y at bit offset 8
+[ :y ( self:v -- u8:o )
+    v
+    8 >>
+    u8~&
+    to o
+]
 ```
 
-loads `v`, then extracts `x`; the original `v` still exists in its local slot.
+This deliberately reuses the field type's ordinary `&` operation rather than embedding the `mask` value into runtime extraction.
+
+Effective stack effect:
+
+```text
+owner -> field-value
+```
+
+The owner is consumed because the signature says so. A caller that needs it again keeps it in a local or explicitly returns/preserves it through ordinary stack semantics.
+
+The compiler may later inline these generated words, but that is an optimization only.
 
 ## 11. Pointer-backed types
 
-Representation kind is determined by the type system, not field syntax.
+Representation kind is determined by type ancestry, not field syntax.
 
-Introduce one minimal builtin/internal pointer base type (working name `ptr`). A type deriving from it is address-backed; other types are value-backed.
-
-Use the existing `NODE_TYPE` ancestry chain to test this property.
+Introduce one minimal internal/builtin pointer base type (working name `ptr`). A type deriving from it is address-backed; other layout types are value-backed.
 
 ```forth
 [ ptr:header
@@ -305,23 +304,81 @@ Use the existing `NODE_TYPE` ancestry chain to test this property.
 ]
 ```
 
-means a `header` qword is an address to packed storage.
+For an address-backed owner, generate ordinary accessor words from existing operations:
 
-For an address-backed owner:
+```forth
+# conceptual a at byte offset 0
+[ :a ( self:v -- u32:o )
+    v
+    u32~@
+    to o
+]
 
-- field bit offsets are still derived from the same dense layout;
-- scalar fields are read from memory at the corresponding offset and masked to their width;
-- a field whose representation is itself address-backed may return the address of that embedded subregion rather than loading it.
+# conceptual b at byte offset 4
+[ :b ( self:v -- u8:o )
+    v
+    4 +
+    u8~@
+    to o
+]
+```
 
-Initial implementation should reject address-backed field offsets/extents that are not byte-aligned unless bit-addressed memory loads are deliberately implemented.
+Rules for the initial implementation:
 
-Do not introduce separate `@(`/`$(` signature forms or receiver modes.
+- address-backed field offsets/extents must be byte-aligned;
+- value/scalar field types must provide the ordinary `@` operation needed to load themselves from an address;
+- an address-backed field type denotes an embedded address-backed subregion and may return `base + offset` typed as that field type instead of loading;
+- stored-pointer indirection is a later, distinct type-model concern rather than another field flag.
 
-## 12. Constructors and namespaces
+Do not add width-specific field loads to the kernel and do not add `@(`/`$(` signature modes.
 
-A definition is callable only according to its ordinary signature/body.
+## 12. Member lookup and local visibility
 
-Example constructor:
+Signature locals and public members currently share physical node-dictionary machinery. Keep the storage unified but separate lookup semantics.
+
+Requirements:
+
+- lexical lookup may resolve `word_local` nodes;
+- public/member lookup must never expose `word_local` nodes;
+- fields and ordinary nested words remain public members;
+- inherited member lookup continues through `NODE_TYPE`.
+
+Prefer the smallest change around existing `find_node`/`find_member`:
+
+- use direct `find_node` where lexical locals are allowed;
+- make public `find_member` skip locals and continue normal type-chain lookup.
+
+Do not create a second dictionary structure.
+
+## 13. Typed-local member syntax
+
+Implement:
+
+```forth
+v~x
+```
+
+when `v` resolves to a typed `word_local` as a compile-time rewrite using existing mechanisms:
+
+1. resolve `v` lexically;
+2. emit the existing `internal_local_get` for `v`;
+3. read `NODE_TYPE(v)`;
+4. resolve `x` through that type's public member chain;
+5. compile the resolved ordinary member call.
+
+Do not put the local node in `SCOPE_CONTEXT_TAG`; that scope context is dictionary-dispatch state, not a data-stack value.
+
+For untyped values, explicit qualification remains valid:
+
+```forth
+value something~x
+```
+
+There is no runtime value-based dispatch because qwords carry no runtime type tag.
+
+## 14. Constructors and namespaces
+
+A definition's optional signature/body is its ordinary callable behavior and may act as a constructor:
 
 ```forth
 [ :something
@@ -333,9 +390,9 @@ Example constructor:
 ]
 ```
 
-Calling `something` consumes its declared inputs and emits a qword typed as `something` in compiler analysis.
+Calling `something` consumes the declared inputs and emits the declared output. Compiler analysis assigns `self:v` the type `something`.
 
-A nested word with no owning-type input is simply a namespaced/static function:
+A nested member without an owning-type input is simply namespaced/static behavior:
 
 ```forth
 [ :something
@@ -345,65 +402,59 @@ A nested word with no owning-type input is simply a namespaced/static function:
 ]
 ```
 
-No separate static flag is needed.
+No static flag is required.
 
-`immediate` stays orthogonal: it only chooses compile-time execution instead of call emission.
+`immediate` stays orthogonal: it changes when an ordinary word executes, not what kind of value it receives.
 
-## 13. Compiler type validation
+## 15. Compiler type validation
 
-Runtime qwords remain untagged. Add validation to the compiler's abstract stack rather than runtime primitives.
+Runtime values remain untagged. Add type validation to the compiler abstract stack.
 
-Track, at minimum:
+Track at least:
 
 ```text
 unknown
-concrete NODE_TYPE
+concrete node type
 ```
 
 Rules:
 
-- unknown input may call anything compatible with stack arity;
-- known typed input must satisfy the callee's declared type, following `NODE_TYPE` ancestry;
-- local get pushes the local's declared type;
-- constructor outputs push their declared output type (`self:v` included);
-- field access consumes the owner value and pushes the field's `NODE_TYPE`;
+- unknown values remain callable where only arity is known;
+- known typed inputs must satisfy declared input types through `NODE_TYPE` ancestry;
+- local-get pushes the local's declared type;
+- constructor outputs push their declared output type;
+- generated field words are validated exactly like any other signed word;
 - reused output locals retain their declared type;
-- a namespaced member does not require an owner value unless its signature declares one.
+- namespaced members require only the inputs in their signatures.
 
-This is where `something~double` validates that TOS is `something`; there is no separate receiver validation pass.
+There is no separate receiver validation pass.
 
-## 14. Implementation order
+## 16. Implementation order
 
-1. Fix existing parser/runtime defects independently (including the known `parse_hex` empty-input test).
-2. Add lexical `self` resolution in type declarations.
-3. Split lexical-local lookup from public member lookup.
-4. Add `word_field` and `compile_field`.
-5. Refactor `compile_definition_open` to parse leading field declarations before the optional signature.
-6. Add isolated immediate-property query and `mask` validation.
-7. Compute field offsets/widths recursively during definition.
-8. Implement packed scalar `word_field` extraction.
-9. Implement typed-local `v~member` as local-get + static member resolution.
-10. Add the internal pointer base type and address-backed field path.
-11. Add compiler abstract-stack type validation.
-12. Only then optimize identity constructors/pass-through locals or constant-fold immediate properties.
+[x] 1. Fix independent known defects first, including the `parse_hex` empty-input test.
+[x] 2. Add lexical `self` resolution in `resolve_declaration_type`.
+3. Split lexical-local visibility from public member lookup without splitting storage.
+4. Factor existing child creation/publication so fields can reuse it without `internal_skip`.
+5. Add `NODE_FIELD_MASK` and preamble `compile_field` generation using ordinary `word_exec` nodes.
+6. Refactor `compile_definition_open` into the field/signature/body preamble loop.
+7. Add isolated `query_immediate_value` implemented around existing `word_exec`.
+8. Add recursive field measurement using direct field flags and leaf `mask` queries.
+9. Generate packed-value accessors from existing local-get, literal, shift, member `&`, and local-set/signature machinery.
+10. Implement typed-local `v~member` as existing local-get plus static type-member resolution.
+11. Add the minimal pointer base type and generate address-backed accessors using existing `+` and type `@` operations.
+12. Add compiler abstract-stack type validation.
+13. Only then optimize generated field accessors, identity constructors, pass-through locals, or immediate constants.
 
-## 15. Required tests
+## 17. Required tests
 
-### Leaf mask
+### Leaf property
 
-```forth
-u8~mask  -> 0xff at compile time
-u16~mask -> 0xffff at compile time
+```text
+u8~mask  -> 0xff during isolated compile-time query
+u16~mask -> 0xffff during isolated compile-time query
 ```
 
-Reject:
-
-- missing `mask` for a leaf field type;
-- non-immediate `mask`;
-- inputs on `mask`;
-- zero/multiple outputs;
-- zero or non-contiguous mask;
-- `mask` attempting `lit`/runtime emission during layout query.
+Reject missing/non-immediate `mask`, non-zero inputs, zero/multiple outputs, zero/non-contiguous masks, stack imbalance, and compile-target emission.
 
 ### Layout
 
@@ -415,14 +466,11 @@ Reject:
 ]
 ```
 
-Must produce:
+must measure 8/8/16-bit fields at offsets 0/8/16 and total width 32.
 
-```text
-x offset 0,  width 8
-y offset 8,  width 8
-z offset 16, width 16
-total width 32
-```
+### Generated field word
+
+`something~y` must execute as an ordinary signed child word equivalent to shift-right by 8 then `u8~&`; no `word_field` path exists.
 
 ### Constructor
 
@@ -430,9 +478,9 @@ total width 32
 1 2 3 something
 ```
 
-must consume three qwords and produce one qword whose compiler type is `something`.
+must consume three qwords and emit one output typed `something` in compiler analysis.
 
-### Typed local fields
+### Typed local
 
 ```forth
 [ :f ( something:v -- )
@@ -440,7 +488,7 @@ must consume three qwords and produce one qword whose compiler type is `somethin
 ]
 ```
 
-must emit local-get for `v`, then field extraction, and infer result type `u8`.
+must emit existing local-get then compile the generated `x` member; inferred result type is `u8`.
 
 ### Pass-through
 
@@ -448,35 +496,42 @@ must emit local-get for `v`, then field extraction, and infer result type `u8`.
 [ :identity ( something:v -- v ) ]
 ```
 
-must consume and re-emit the same declared local through existing signature semantics; no receiver machinery is involved.
+must use existing input/output-local reuse only.
 
-### Namespace/static member
+### Namespace member
 
 ```forth
 something~whatever
 ```
 
-must require only `whatever`'s declared inputs, not an implicit `something` value.
+must require only `whatever`'s declared inputs; no implicit owner value exists.
 
 ### Pointer-backed layout
 
-A `ptr`-derived owner must interpret fields relative to its TOS address; a value-backed owner must extract fields from the qword itself.
+A `ptr`-derived owner must generate address-relative field words using ordinary `+` and field-type `@`; a value-backed owner must generate shift/`&` words.
 
-## 16. Explicit non-goals
+### Limits
+
+Reject value-backed layouts wider than 64 bits, non-byte-aligned address-backed fields in the initial implementation, and recursive-by-value layout cycles.
+
+## 18. Explicit non-goals
 
 Do not add in this pass:
 
 - hidden/preserved receivers;
 - receiver registers or scope-stack receiver values;
-- receiver node flags;
-- special signature prefixes;
+- receiver node flags or signature prefixes;
+- `word_field` or a field-specific runtime evaluator;
+- per-field offset/width payloads;
 - `NODE_SIZE`;
 - static-value node/storage classes;
 - `size`/`mask` declaration keywords;
-- magic execution/introspection of `&`;
+- magic inspection/execution of `&` to infer width;
 - automatic `lit` behavior for `mask`;
 - implicit alignment/padding;
+- width-specific kernel field-load primitives;
 - runtime tagged values;
-- runtime value-based dynamic dispatch.
+- runtime value-based dynamic dispatch;
+- stored-pointer field semantics beyond a later explicit type model.
 
-The implementation should first make the existing dictionary, signature, immediate, and type mechanisms compose cleanly; optimization and richer ABI layout rules can follow later.
+The first implementation should make the existing dictionary, signatures, immediates, locals, type ancestry, and ordinary word execution compose cleanly. New runtime machinery should be added only where existing Hitherto operations cannot express the behavior.
