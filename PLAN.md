@@ -331,24 +331,25 @@ Rules for the initial implementation:
 - stored-pointer indirection is a later, distinct type-model concern rather than another field flag.
 
 Do not add width-specific field loads to the kernel and do not add `@(`/`$(` signature modes.
-
 ## 12. Member lookup and local visibility
 
-Signature locals and public members currently share physical node-dictionary machinery. Keep the storage unified but separate lookup semantics.
+Signature locals and public members share the same physical child dictionary. Keep storage unified, but give lexical and member lookup different visibility rules.
 
 Requirements:
 
-- lexical lookup may resolve `word_local` nodes;
-- public/member lookup must never expose `word_local` nodes;
-- fields and ordinary nested words remain public members;
-- inherited member lookup continues through `NODE_TYPE`.
+* lexical lookup may resolve `word_local` nodes;
+* locals may shadow public or inherited members for plain lexical names;
+* public/member lookup must skip `word_local` matches and continue searching;
+* fields and ordinary nested words remain public members;
+* inherited member lookup continues through `NODE_TYPE`;
+* duplicate locals in the same definition remain invalid.
 
-Prefer the smallest change around existing `find_node`/`find_member`:
+Keep `find_node` as raw direct-child lookup.
 
-- use direct `find_node` where lexical locals are allowed;
-- make public `find_member` skip locals and continue normal type-chain lookup.
+`find_member` must ignore `word_local` nodes while continuing normal child/type-chain traversal.
 
 Do not create a second dictionary structure.
+
 
 ## 13. Typed-local member syntax
 
@@ -433,7 +434,7 @@ There is no separate receiver validation pass.
 
 [x] 1. Fix independent known defects first, including the `parse_hex` empty-input test.
 [x] 2. Add lexical `self` resolution in `resolve_declaration_type`.
-3. Split lexical-local visibility from public member lookup without splitting storage.
+[x] 3. Separate lexical lookup from public member lookup: find_scope may resolve direct signature locals; find_member must resolve only public members and type inheritance.
 4. Factor existing child creation/publication so fields can reuse it without `internal_skip`.
 5. Add `NODE_FIELD_MASK` and preamble `compile_field` generation using ordinary `word_exec` nodes.
 6. Refactor `compile_definition_open` into the field/signature/body preamble loop.

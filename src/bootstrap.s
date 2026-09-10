@@ -2273,26 +2273,44 @@ find_node:
 # r8 = node
 # rsi = member name
 # r9 = member name len
-# Searches node children, node type's children, inherited type chain
+# Searches public children, then NODE_TYPE chain.
+# word_local matches are skipped (searches from external node)
 # returns:
+#   rax = matching public member
 #   CF = 0 found
-#   CF = 1 not
+#   CF = 1 not found
 find_member:
 .find_member_next:
     call find_node
-    jnc .find_member_done
+    jc .find_member_type
 
+.find_member_check:
+    lea rcx, [rip + word_local]
+    cmp [rax + NODE_CODE], rcx
+    jne .find_member_found
+
+    # Matching local is not a public member.
+    # Resume this same dictionary before the local.
+    mov rcx, [rax + NODE_END]
+    mov rdx, [rcx]
+    call find_dict
+    jnc .find_member_check
+
+.find_member_type:
     mov rax, r8
     call node_type
-
     test rax, rax
     jz .find_member_missing
 
     mov r8, rax
     jmp .find_member_next
+
+.find_member_found:
+    clc
+    ret
+
 .find_member_missing:
     stc
-.find_member_done:
     ret
 
 # returns:
@@ -2389,7 +2407,13 @@ find_scope:
     cmp qword ptr [rip + state], STATE_DEF
     jne .find_scope_root
 
-    # current scope including type inheritance
+    # direct current children first: locals participate and shadow
+    mov r8, rbp
+    call find_node
+    jnc .find_scope_static
+
+    # then public members of current definition / type chain
+    # find_member skips locals
     mov r8, rbp
     call find_member
     jnc .find_scope_static
@@ -2409,15 +2433,22 @@ find_scope:
 
     and rax, -8
     mov r8, rax
+
+    # first: direct children first + locals
+    call find_node
+    jnc .find_scope_found
+
+    # next: public / inherited members no locals!
     call find_member
     jc .find_scope_parent
 
+.find_scope_found:
     # parent locals remain static
     lea rdx, [rip + word_local]
     cmp [rax + NODE_CODE], rdx
     je .find_scope_static
 
-.find_scope_virtual:
+    # parent words and inherited members are virtual
     mov r10d, 1
     clc
     jmp .find_scope_done
