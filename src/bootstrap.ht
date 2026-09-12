@@ -6,65 +6,23 @@
     [ :io-length $34 ]
 ]
 
-[ :linux
-    # read: fd buf count -> result
-    # Linux syscall 0
-    [ :read
-        $3 !        # count
-        $2 !        # buffer address
-        $1 !        # file descriptor
-        0 $0 !      # SYS_read
-        sys
-        $0 @        # return value
-    ]
-
-    # write: fd buf count -> result
-    # Linux syscall 1
-    [ :write
-        $3 !        # count
-        $2 !        # buffer address
-        $1 !        # file descriptor
-        1 $0 !      # SYS_write
-        sys
-        $0 @        # return value
-    ]
-
-    # open: filename -> fd
-    # Linux syscall 2
-    [ :open
-        0 $2 !      # mode
-        0 $1 !      # O_RDONLY
-        $0 !        # filename address
-        2 $0 !      # SYS_open
-        sys
-        $0 @        # return fd
-    ]
-
-    # exit: status -> nothing
-    # Linux syscall 60
-    [ :exit
-        $1 !        # exit status
-        60 $0 !     # SYS_exit
-        sys
-    ]
-
-    # mmap: length -> result
-    # Linux syscall 9
-    [ :mmap
-        $2 !        # length, consume from stack
-        9 $0 !      # SYS_MMAP
-        0 $1 !      # addr = null
-        3 $3 !      # PROT_READ | PROT_WRITE
-        34 $4 !     # MAP_PRIVATE | MAP_ANONYMOUS
-        -1 $5 !     # fd
-        0 $6 !      # offset
-        sys
-        $0 @        # return value
+[ :addr ]
+[ :cell
+    [ :field ( :v :offset :mask -- :o )
+        v
+        offset >>
+        mask
+        &
+        to o
     ]
 ]
 
-# standard numeric data types
-[ :u8
+[ cell:b8
+    [ :mask ( -- :v )
+        0xff to v
+        immediate
+    ]
+
     [ :& 0xff & ]
     [ :@
         [ 0x4d 0x0f 0xb6 0x6d 0x00 asm ]
@@ -78,13 +36,138 @@
         _ _
     ]
 ]
-[ :u32
+[ cell:b16
+    [ :mask ( -- :v )
+        0xffff to v
+        immediate
+    ]
+
+    [ :& 0xffff & ]
+    [ :@
+        [
+            # movzx r13, word ptr [r13]
+            0x4d 0x0f 0xb7 0x6d 0x00
+            asm
+        ]
+    ]
+    [ :!
+        [
+            0x66 0x41 0x8b 0x47 0xf8p # mov ax, word ptr [r15 - 8]
+            0x66 0x41 0x89 0x45 0x00 # mov word ptr [r13], ax
+            asm
+        ]
+        _ _
+    ]
+]
+[ cell:b32
+    [ :mask ( -- :v )
+        0xffffffff to v
+        immediate
+    ]
+
     [ :& 0xffffffff & ]
+
+    [ :@
+        [
+            # mov r13d, dword ptr [r13]
+            0x45 0x8b 0x6d 0x00
+            asm
+        ]
+    ]
+    [ :!
+        [
+            0x41 0x8b 0x47 0xf8 # mov eax, dword ptr [r15 - 8]
+            0x41 0x89 0x45 0x00 # mov dword ptr [r13], eax
+            asm
+        ]
+        _ _
+    ]
+]
+[ cell:b64
+    [ :mask ( -- :v )
+        0xffffffffffffffff to v
+        immediate
+    ]
+
+    [ :& ] # noop, already 64 bit qword
+    [ :@
+        # mov r13, qword ptr [r13]
+        [ 0x4d 0x8b 0x6d 0x00 asm ]
+    ]
+    [ :!
+        [
+            0x49 0x8b 0x47 0xf8 # mov rax, qword ptr [r15 - 8]
+            0x49 0x89 0x45 0x00 # mov qword ptr [r13], rax
+            asm
+        ]
+        _ _
+    ]
+]
+[ b8:u8 ]
+[ b16:u16 ]
+[ b32:u32 ]
+[ b64:u64 ]
+
+[ b8:i8
+    # mask 8 bits, then sign extend
+    [ :&
+        b8~&
+        [
+            # movsx r13, r13b
+            0x4d 0x0f 0xbe 0xed 
+            asm
+        ]
+    ]
+    [ :@
+        [
+            # movsx r13, byte ptr [r13]
+            0x4d 0x0f 0xbe 0x6d 0x00 
+            asm
+        ]
+    ]
+]
+
+[ b16:i16
+    [ :&
+        b16~&
+        [
+            # movsx r13, r13w
+            0x4d 0x0f 0xbf 0xed
+            asm
+        ]
+    ]
+    [ :@
+        [
+            # movsx r13, word ptr [r13]
+            0x4d 0x0f 0xbf 0x6d 0x00
+            asm
+        ]
+    ]
+]
+[ b32:i32
+    [ :&
+        b32~&
+        [
+            # movsxd r13, r13d
+            0x4d 0x64 0xed
+            asm
+        ]
+    ]
+    [ :@
+        [
+            # movsxd r13, dword ptr [r13]
+            0x4d 0x64 0x6d 0x00
+            asm
+        ]
+    ]
+]
+[ b64:i64
+    # passthrough: builtins already do this
 ]
 
 [ :memory
-    [ :ptr ]
-    [ :len ]
+    [ addr:ptr ]
+    [ u64:len ]
     [ :span
         ^ ptr
         >< len
@@ -93,7 +176,7 @@
 
 # str is a printable memory span (ie. the string type)
 [ memory:str
-    [ :ptr
+    [ addr:ptr
         ^ @
         u32~&
         +
@@ -107,12 +190,65 @@
         -
     ]
     [ :.
-        [ :write-err 1 linux~exit ]
+        [ :err 13 panic ]
         1 # stdout
         ><
         span
         linux~write
-        0 < ? write-err
+        0 < ? err
+    ]
+]
+
+[ :linux
+    [ :read ( u32:fd addr:buf u64:count -- :result )
+        fd $1 !
+        buf $2 !
+        count $3 !
+
+        0 $0 !
+        sys
+        $0 @ to result
+    ]
+
+    [ :write ( u32:fd addr:buf u64:count -- :result )
+        fd $1 !
+        buf $2 !
+        count $3 !
+        
+        1 $0 !
+        sys
+        $0 @ to result
+    ]
+
+    [ :open-raw ( addr:path u32:flags u32:mode -- u32:fd )
+        path $1 !
+        flags $2 !
+        mode $3 !
+        2 $0 !
+        sys
+        $0 @ to fd
+    ]
+    [ :open ( str:path u32:flags u32:mode -- u32:fd )
+        path~ptr
+        open-raw
+    ]
+    
+    [ :exit ( u32:code  -- )
+        code $1 !
+        60 $0 !
+        sys
+    ]
+
+    [ :mmap ( addr:ptr u64:len u32:prot u32:flags u32:fd u32:offset -- :result )
+        9 $0 !
+        ptr $1 !
+        len $2 !
+        prot $3 !
+        scope $4 !
+        addr $5 !
+        offset $6 !
+        sys
+        $0 @ to result
     ]
 ]
 

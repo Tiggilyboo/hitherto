@@ -1373,6 +1373,49 @@ word_mul:
     imul r13, [r15]
     ret
 
+word_div:
+    mov rcx, r13 # divisor = rhs TOS
+    test rcx, rcx
+    jz panic_div_zero
+    sub r15, 8
+    mov rax, [r15] # dividend = lhs
+    cqo
+    idiv rcx # rax = div, rdx = remainder
+    mov r13, rax
+    ret
+
+word_udiv:
+    mov rcx, r13
+    test rcx, rcx
+    jz panic_div_zero
+    sub r15, 8
+    mov rax, [r15]
+    xor edx, edx
+    div rcx
+    mov r13, rax
+    ret
+
+word_shl:
+    mov rcx, r13
+    sub r15, 8
+    mov r13, [r15]
+    shl r13, cl
+    ret
+
+word_shr:
+    mov rcx, r13
+    sub r15, 8
+    mov r13, [r15]
+    shr r13, cl
+    ret
+
+word_sar:
+    mov rcx, r13
+    sub r15, 8
+    mov r13, [r15]
+    sar r13, cl
+    ret
+
 # rax = dictionary node being executed
 word_exec:
     push rbp
@@ -1492,17 +1535,6 @@ word_write:
     mov r13, [r15]
     ret
     
-word_div:
-    mov rcx, r13 # divisor = rhs TOS
-    test rcx, rcx
-    jz panic_div_zero
-    sub r15, 8
-    mov rax, [r15] # dividend = lhs
-    cqo
-    idiv rcx # rax = div, rdx = remainder
-    mov r13, rax
-    ret
-
 word_tick:
     call read_token
     jc panic_token_noclose
@@ -1705,18 +1737,11 @@ word_lt:
     movzx r13, r13b
     ret
 
-word_shl:
-    mov rcx, r13
+word_ult:
     sub r15, 8
-    mov r13, [r15]
-    shl r13, cl
-    ret
-
-word_shr:
-    mov rcx, r13
-    sub r15, 8
-    mov r13, [r15]
-    shr r13, cl
+    cmp [r15], r13
+    setb r13b
+    movzx r13, r13b
     ret
 
 word_immediate:

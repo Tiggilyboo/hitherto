@@ -1,538 +1,367 @@
-# Hitherto Typed Layout and Invocation Plan
+# Hitherto Typed Bootstrap Plan
 
-## 1. Design goals
+## Goal
 
-Keep the feature inside Hitherto's existing mechanisms:
+Keep runtime typing at zero cost.
 
-- definitions remain callable words and namespaces;
-- `type:name` remains the declaration form;
-- signatures remain the only stack/invocation contract;
-- `self` is only a lexical type alias;
-- there is no hidden receiver, receiver register, receiver flag, or signature prefix;
-- `immediate` remains compile-time execution only;
-- fields are ordinary generated child words, not a parallel runtime object system;
-- leaf packed width comes from an immediate `mask` member;
-- composite width is derived from fields;
-- runtime values remain untagged qwords; type checking belongs in the compiler.
+- Runtime values remain untagged qwords.
+- The assembly core remains a small Forth-like qword machine.
+- Numeric width/signedness semantics live in Hitherto type members, using `asm` where machine behavior differs.
+- The compiler tracks only type-node pointers while compiling; no runtime type metadata or dispatch is emitted.
+- The compiler knows nothing about signedness, widths, `DIV`/`IDIV`, `SHR`/`SAR`, etc. It only resolves members and validates signatures.
+- Field/layout sugar is deferred to the future Hitherto-hosted compiler.
 
-Working shape:
+## 1. Existing foundations
+
+Already implemented:
+
+1. `parse_hex` defect fix.
+2. Lexical `self` resolution.
+3. Lexical locals vs public/inherited member lookup.
+
+Keep these invariants:
+
+- `self` is only a lexical type alias.
+- Signatures are the only invocation contract.
+- Runtime values have no hidden receiver or type tag.
+- Public member lookup skips locals and follows `NODE_TYPE` ancestry.
+
+## 2. Bootstrap type hierarchy
+
+Use representation types for width and derived types for interpretation:
+
+```text
+cell
+├── b8
+│   ├── u8
+│   └── i8
+├── b16
+│   ├── u16
+│   └── i16
+├── b32
+│   ├── u32
+│   └── i32
+└── b64
+    ├── u64
+    └── i64
+
+addr
+memory
+└── str
+```
+
+Meaning:
+
+- `cell`: packed scalar qword semantics.
+- `bN`: physical width/bit-pattern behavior.
+- `uN` / `iN`: unsigned/signed interpretation.
+- `addr`: numerical address value; separate from packed scalar semantics.
+- `memory`: pointer + length abstraction.
+- `str`: printable length-delimited memory span; not NUL-terminated.
+
+## 3. Numeric behavior belongs to the types
+
+Typed numeric operations must resolve through the type hierarchy. Do not teach the compiler numeric semantics.
+
+Define common behavior once on `cell`/`bN`; override only where signedness changes behavior.
+
+Common bit-level behavior includes:
+
+```text
++  -  *  <<  =  bitwise ops  store
+```
+
+Signedness-sensitive behavior includes:
+
+```text
+/     DIV vs IDIV
+<     unsigned vs signed comparison
+>>    SHR vs SAR
+.     unsigned vs signed formatting
+@     zero-extension vs sign-extension for narrow loads
+&     narrow canonicalization/sign-extension
+```
+
+Narrow signed canonical forms are sign-extended qwords:
+
+```text
+u8  0xff       -> 255
+i8  0xff       -> -1
+u16 0xffff     -> 65535
+i16 0xffff     -> -1
+u32 0xffffffff -> 4294967295
+i32 0xffffffff -> -1
+```
+
+Thus initially:
+
+```text
+i8   overrides & and @
+i16  overrides & and @
+i32  overrides & and @
+i64  needs no representation override
+```
+
+The typed numeric hierarchy should expose a complete operator surface for operations intended to work on typed values. Implement shared members once and signed/unsigned variants with `asm` where needed.
+
+## 4. Root builtins
+
+Keep root arithmetic builtins as raw/untyped qword operations for bootstrap and explicitly untyped code.
+
+They are not fallback semantics for a known typed value.
+
+Rule:
+
+```text
+known lhs type:
+    resolve operator through lhs type/member chain
+    missing member -> compile error
+
+unknown lhs type:
+    root builtin may be used
+```
+
+This avoids silent errors such as `u64 /` falling through to signed root division.
+
+## 5. Zero-runtime-cost compiler type mirror
+
+The compiler maintains a parallel compile-time stack containing only:
+
+```text
+0             unknown/untyped
+NODE_TYPE*    concrete type node
+```
+
+Nothing is emitted at runtime for this stack.
+
+Runtime code remains exactly the same shape as untyped code; the compiler only chooses which word node to emit.
+
+Examples of compiler-only updates:
+
+```text
+typed local get   push local.NODE_TYPE
+untyped literal   push unknown
+^                 duplicate type
+_                 drop type
+><                swap types
+<^                duplicate NOS type
+```
+
+The mirror is necessary because computed values no longer have a source node to inspect:
 
 ```forth
-[ :u8
-    [ :mask ( -- :v )
-        0xff
-        to v
-        immediate
-    ]
-
-    [ :& 0xff & ]
-
-    ( :i -- self:v )
-        i 0xff &
-        to v
-]
-
-[ :something
-    u8:x
-    u8:y
-    u16:z
-
-    ( u8:x u8:y u16:z -- self:v )
-        x
-        y 8 << |
-        z 16 << |
-        to v
-
-    [ :double ( self:v -- v )
-        v~x 2 *
-        v~y 2 *
-        v~z 2 *
-        something
-        to v
-    ]
-]
+a b + c /
 ```
 
-## 2. Signature semantics
+After `+`, the compiler must remember the result type so later operators can resolve correctly.
 
-Signatures remain unchanged.
+## 6. Operator dispatch
+
+Binary operators dispatch from the lhs/NOS type, not the rhs/TOS type.
+
+```text
+lhs rhs op
+^^^
+operator owner
+```
+
+This is required for operations such as shifts:
 
 ```forth
-( self:v -- v )
+i64:value u8:count
+value count >>
 ```
 
-means:
+`>>` must resolve through `i64`, because the lhs determines `SAR` vs `SHR` and the result type.
 
-- consume one qword into local `v`;
-- type `v` as the lexical owning type;
-- reuse the same local as the output;
-- effective stack effect: `self -> self`.
+Compilation rule:
 
-If an input survives a call, it must appear in the outputs. There is no receiver preservation mechanism.
+1. read lhs type from compile-time type stack;
+2. if known, resolve the operator with `find_member(lhs_type, operator)`;
+3. validate operands against the resolved word signature;
+4. emit that resolved word;
+5. update the compile-time type stack from its outputs.
 
-Existing signed invocation already provides input locals, output-local reuse, validity tracking, caller-stack reclamation, and ordered output emission. Do not extend the signature header for this feature.
+No runtime dispatch occurs.
 
-## 3. `self`
+## 7. Signature type propagation
 
-`self` is only a lexical type alias in a `type:name` declaration.
+Use ordinary signatures for operator and word type checking.
 
-It is not a value, receiver, signature mode, or scope-context pointer.
+For a call:
 
-Initial resolution:
+1. compare known actual input types with declared input types through `NODE_TYPE` ancestry;
+2. bind actual input types to the called word's input locals;
+3. consume input type entries;
+4. push output types.
 
-- in a definition's own constructor, `self` resolves to that definition;
-- in a direct nested member, `self` resolves to the enclosing definition.
+Output rule:
 
-Implement this only in `resolve_declaration_type`. Do not make unfinished definitions ordinarily name-resolvable just to support self-reference.
-
-## 4. Definition preamble
-
-Leading typed declarations before the optional signature are layout fields:
-
-```forth
-[ :header
-    u32:a
-    u8:b
-    u8:c
-
-    ( -- )
-    ... body ...
-]
-```
-
-Declarations inside `( ... )` remain invocation locals.
-
-Refactor `compile_definition_open` into a small preamble loop:
-
-1. read a token;
-2. leading `type:name` -> compile a field, advance layout cursor, continue;
-3. `(` -> use existing `compile_signature`, then establish `code_start` and body control;
-4. anything else -> establish `code_start` and process it with the existing body path;
-5. `]` after fields -> finalize an empty executable body normally.
-
-This keeps fields physically before `code_start`, like signature-local metadata, so invoking the owner never executes field declarations.
-
-Do not move `NODE_BODY` and do not add `NODE_SIZE`.
-
-## 5. Fields are generated ordinary child words
-
-Do not add `word_field` or a field-specific runtime evaluator.
-
-A field is an ordinary `word_exec` child generated by the compiler from existing operations. Mark it only so layout reflection can distinguish fields from ordinary nested members:
-
-```text
-NODE_CODE = word_exec
-NODE_TYPE = declared field type | NODE_FIELD_MASK
-```
-
-Use one currently-free low NODE_TYPE flag bit for `NODE_FIELD_MASK`; `node_type` continues masking flags normally.
-
-No field offset/width payload is required initially. Offset is needed while generating the accessor; later composite measurement can walk direct children marked as fields and recursively measure their types.
-
-Field nodes are public members. Signature locals remain invocation-only bindings.
-
-## 6. Reuse existing child/signature compilation
-
-Factor child creation/publication rather than duplicating `node_add` and node-finalization logic.
-
-Conceptually split current child compilation into reusable pieces:
-
-```text
-compile_child_create
-compile_child_publish
-```
-
-Ordinary nested definitions:
-
-```text
-emit internal_skip
-create child
-compile body
-publish child
-```
-
-Preamble fields:
-
-```text
-create child without parent internal_skip
-mark NODE_FIELD_MASK
-build normal signature/body
-publish child
-```
-
-No skip is needed because the field node is physically before the owner's `code_start`.
-
-Build generated field bodies using existing signature helpers, local nodes, threaded calls, literals, shifts, arithmetic, qualified member calls, and `to`/local-set behavior. Do not duplicate those operations in new field-specific assembly.
-
-## 7. `mask` compile-time property
-
-Do not add size/mask metadata slots and do not inspect the implementation of `&`.
-
-A leaf packed type exposes width through an ordinary immediate member named `mask`:
-
-```forth
-[ :u8
-    [ :mask ( -- :v )
-        0xff
-        to v
-        immediate
-    ]
-]
-```
-
-Layout-query rules:
-
-- member name is `mask`;
-- it is immediate;
-- signature is zero inputs, exactly one output;
-- returned value is a non-zero contiguous low-bit mask (`2^n - 1`);
-- no runtime code may be emitted while the compiler queries it.
-
-Examples:
-
-```text
-u8~mask  -> 0xff    -> width 8
-u16~mask -> 0xffff  -> width 16
-```
-
-Derived scalar types may inherit `mask` through the existing `NODE_TYPE` member chain.
-
-Do not put `lit` inside `mask`; a property query returns a compile-time value. Emission is the caller's separate decision.
-
-## 8. Reuse `word_exec` for isolated property queries
-
-Add one narrow compiler helper, not a second evaluator:
-
-```text
-query_immediate_value(type, member-name) -> qword
-```
-
-It should:
-
-1. resolve the member using existing member/inheritance lookup;
-2. require `NODE_IMMEDIATE_MASK`;
-3. validate the existing signature header as zero-input/one-output;
-4. save compiler state, scope stack, TOS/data-stack position, `rbp`, and `r12`;
-5. run the member through its existing `NODE_CODE`/`word_exec` path in isolated execution state with no compile target;
-6. require exactly one result;
-7. capture the result and restore all surrounding compiler state;
-8. reject stack imbalance, malformed signature, missing member, or attempted code emission.
-
-The helper exists only to isolate and validate an ordinary immediate word.
-
-## 9. Layout measurement
-
-Fields are densely packed in declaration order. No implicit alignment or padding.
-
-For each field type:
-
-- if it has direct layout fields, recursively sum those field widths;
-- otherwise resolve/inherit `mask` and derive width from its contiguous low bits.
+- new output local -> declared type;
+- reused input/output local -> actual type bound to that input at the call site.
 
 Example:
 
 ```forth
-[ :something
-    u8:x
-    u8:y
-    u16:z
-]
+( b64:a b64:b -- a )
 ```
 
-becomes:
+Called with `u64 u64`, the output remains `u64`.
+Called with `i64 i64`, the output remains `i64`.
+
+This allows shared base operations to preserve concrete subtype identity without compiler knowledge of numeric types.
+
+## 8. Mixed numeric types
+
+Do not add implicit promotion rules to the bootstrap compiler.
+
+Initially require operands to satisfy the resolved operator signature through normal ancestry rules.
+
+Examples:
 
 ```text
-x: bit offset 0,  width 8
-y: bit offset 8,  width 8
-z: bit offset 16, width 16
-total width 32
+u64 + u64    valid
+i64 / i64    valid
+u32 + u16    error unless explicitly converted
+i32 < u32    error unless explicitly converted
 ```
 
-The current layout cursor is compile-time state only; it is not stored in each field node.
+Promotion/coercion policy can be added later in the hosted compiler.
 
-Initial limits:
+## 9. Control flow
 
-- value-backed packed values must fit in one qword (total width <= 64 bits);
-- address-backed layouts may exceed 64 bits because the qword represents an address;
-- reject recursive-by-value layouts and any cycle that prevents finite measurement.
+Type tracking must remain compile-time only.
 
-## 10. Generated packed-value field accessors
+At control-flow joins, require compatible abstract stacks:
 
-For a value-backed owner, generate an ordinary consuming accessor.
+- same depth;
+- each known type compatible with the corresponding joined type;
+- otherwise reject compilation.
 
-Conceptually:
+Do not emit runtime type reconciliation.
 
-```forth
-# x at bit offset 0
-[ :x ( self:v -- u8:o )
-    v
-    u8~&
-    to o
-]
-
-# y at bit offset 8
-[ :y ( self:v -- u8:o )
-    v
-    8 >>
-    u8~&
-    to o
-]
-```
-
-This deliberately reuses the field type's ordinary `&` operation rather than embedding the `mask` value into runtime extraction.
-
-Effective stack effect:
-
-```text
-owner -> field-value
-```
-
-The owner is consumed because the signature says so. A caller that needs it again keeps it in a local or explicitly returns/preserves it through ordinary stack semantics.
-
-The compiler may later inline these generated words, but that is an optimization only.
-
-## 11. Pointer-backed types
-
-Representation kind is determined by type ancestry, not field syntax.
-
-Introduce one minimal internal/builtin pointer base type (working name `ptr`). A type deriving from it is address-backed; other layout types are value-backed.
-
-```forth
-[ ptr:header
-    u32:a
-    u8:b
-]
-```
-
-For an address-backed owner, generate ordinary accessor words from existing operations:
-
-```forth
-# conceptual a at byte offset 0
-[ :a ( self:v -- u32:o )
-    v
-    u32~@
-    to o
-]
-
-# conceptual b at byte offset 4
-[ :b ( self:v -- u8:o )
-    v
-    4 +
-    u8~@
-    to o
-]
-```
-
-Rules for the initial implementation:
-
-- address-backed field offsets/extents must be byte-aligned;
-- value/scalar field types must provide the ordinary `@` operation needed to load themselves from an address;
-- an address-backed field type denotes an embedded address-backed subregion and may return `base + offset` typed as that field type instead of loading;
-- stored-pointer indirection is a later, distinct type-model concern rather than another field flag.
-
-Do not add width-specific field loads to the kernel and do not add `@(`/`$(` signature modes.
-## 12. Member lookup and local visibility
-
-Signature locals and public members share the same physical child dictionary. Keep storage unified, but give lexical and member lookup different visibility rules.
-
-Requirements:
-
-* lexical lookup may resolve `word_local` nodes;
-* locals may shadow public or inherited members for plain lexical names;
-* public/member lookup must skip `word_local` matches and continue searching;
-* fields and ordinary nested words remain public members;
-* inherited member lookup continues through `NODE_TYPE`;
-* duplicate locals in the same definition remain invalid.
-
-Keep `find_node` as raw direct-child lookup.
-
-`find_member` must ignore `word_local` nodes while continuing normal child/type-chain traversal.
-
-Do not create a second dictionary structure.
-
-
-## 13. Typed-local member syntax
+## 10. Typed local members
 
 Implement:
 
 ```forth
-v~x
+v~member
 ```
 
-when `v` resolves to a typed `word_local` as a compile-time rewrite using existing mechanisms:
+for typed locals as a compile-time rewrite:
 
-1. resolve `v` lexically;
-2. emit the existing `internal_local_get` for `v`;
-3. read `NODE_TYPE(v)`;
-4. resolve `x` through that type's public member chain;
-5. compile the resolved ordinary member call.
+1. emit normal local-get for `v`;
+2. read `NODE_TYPE(v)`;
+3. resolve `member` through that type's public member chain;
+4. compile the ordinary member call.
 
-Do not put the local node in `SCOPE_CONTEXT_TAG`; that scope context is dictionary-dispatch state, not a data-stack value.
+Do not treat locals as runtime receiver/scope objects.
 
-For untyped values, explicit qualification remains valid:
+## 11. Fields and layout
 
-```forth
-value something~x
-```
-
-There is no runtime value-based dispatch because qwords carry no runtime type tag.
-
-## 14. Constructors and namespaces
-
-A definition's optional signature/body is its ordinary callable behavior and may act as a constructor:
+Keep generic field extraction in Hitherto:
 
 ```forth
-[ :something
-    ... fields ...
-
-    ( u8:x u8:y u16:z -- self:v )
-        ...
-        to v
-]
-```
-
-Calling `something` consumes the declared inputs and emits the declared output. Compiler analysis assigns `self:v` the type `something`.
-
-A nested member without an owning-type input is simply namespaced/static behavior:
-
-```forth
-[ :something
-    [ :whatever ( -- :v )
-        123 to v
+[ :cell
+    [ :field ( :v :offset :mask -- :o )
+        v
+        offset >>
+        mask
+        &
+        to o
     ]
 ]
 ```
 
-No static flag is required.
-
-`immediate` stays orthogonal: it changes when an ordinary word executes, not what kind of value it receives.
-
-## 15. Compiler type validation
-
-Runtime values remain untagged. Add type validation to the compiler abstract stack.
-
-Track at least:
-
-```text
-unknown
-concrete node type
-```
-
-Rules:
-
-- unknown values remain callable where only arity is known;
-- known typed inputs must satisfy declared input types through `NODE_TYPE` ancestry;
-- local-get pushes the local's declared type;
-- constructor outputs push their declared output type;
-- generated field words are validated exactly like any other signed word;
-- reused output locals retain their declared type;
-- namespaced members require only the inputs in their signatures.
-
-There is no separate receiver validation pass.
-
-## 16. Implementation order
-
-[x] 1. Fix independent known defects first, including the `parse_hex` empty-input test.
-[x] 2. Add lexical `self` resolution in `resolve_declaration_type`.
-[x] 3. Separate lexical lookup from public member lookup: find_scope may resolve direct signature locals; find_member must resolve only public members and type inheritance.
-4. Factor existing child creation/publication so fields can reuse it without `internal_skip`.
-5. Add `NODE_FIELD_MASK` and preamble `compile_field` generation using ordinary `word_exec` nodes.
-6. Refactor `compile_definition_open` into the field/signature/body preamble loop.
-7. Add isolated `query_immediate_value` implemented around existing `word_exec`.
-8. Add recursive field measurement using direct field flags and leaf `mask` queries.
-9. Generate packed-value accessors from existing local-get, literal, shift, member `&`, and local-set/signature machinery.
-10. Implement typed-local `v~member` as existing local-get plus static type-member resolution.
-11. Add the minimal pointer base type and generate address-backed accessors using existing `+` and type `@` operations.
-12. Add compiler abstract-stack type validation.
-13. Only then optimize generated field accessors, identity constructors, pass-through locals, or immediate constants.
-
-## 17. Required tests
-
-### Leaf property
-
-```text
-u8~mask  -> 0xff during isolated compile-time query
-u16~mask -> 0xffff during isolated compile-time query
-```
-
-Reject missing/non-immediate `mask`, non-zero inputs, zero/multiple outputs, zero/non-contiguous masks, stack imbalance, and compile-target emission.
-
-### Layout
+Concrete accessors can already be written using ordinary Hitherto:
 
 ```forth
-[ :something
-    u8:x
-    u8:y
-    u16:z
+[ i8:x
+    ( self:v -- i8:o )
+    v 8 mask field & to o
 ]
 ```
 
-must measure 8/8/16-bit fields at offsets 0/8/16 and total width 32.
+The final type `&` canonicalizes signed or unsigned field values.
 
-### Generated field word
+Defer all compiler sugar for:
 
-`something~y` must execute as an ordinary signed child word equivalent to shift-right by 8 then `u8~&`; no `word_field` path exists.
+- `u8:x` layout declarations;
+- automatic offsets/layout measurement;
+- generated field accessors;
+- field flags/metadata;
+- pointer-backed layout generation.
 
-### Constructor
+Those belong in the future Hitherto-hosted compiler.
 
-```forth
-1 2 3 something
+## 12. Linux boundary
+
+Keep syscall ABI lowering separate from Hitherto value abstractions.
+
+- `addr` is the raw address value type.
+- `memory` exposes pointer + length.
+- `str` is length-delimited and not NUL-terminated.
+- pathname syscalls must materialize a NUL-terminated representation at the Linux boundary.
+- raw syscall results remain signed/raw until success is checked; only then refine to types such as `fd` or `addr`.
+
+## 13. Implementation order
+
+1. Establish `cell`, `b8/b16/b32/b64`, `u8/u16/u32/u64`, `i8/i16/i32/i64`, and `addr`.
+2. Implement width masks, canonicalizers, narrow loads/stores, and signed narrow extension.
+3. Implement complete typed arithmetic/comparison/shift behavior in Hitherto, using `asm` for machine variants.
+4. Add the compiler-only type stack of type-node pointers.
+5. Mirror normal Forth stack operations on the type stack.
+6. Add lhs-directed typed operator resolution with no root fallback for known types.
+7. Add signature input validation and output type propagation, including concrete type preservation for reused outputs.
+8. Validate type stacks across control-flow joins.
+9. Implement typed-local `v~member`.
+10. Build `memory`, `str`, and typed Linux wrappers on top.
+11. Defer field/layout sugar to the hosted compiler.
+12. Optimize only after semantics are stable.
+
+## 14. Required tests
+
+Verify at minimum:
+
+```text
+signed/unsigned narrow canonicalization
+signed/unsigned narrow loads
+u64 vs i64 division
+u64 vs i64 comparison
+u64 SHR vs i64 SAR
+no root fallback for known typed operators
+root builtins still work for unknown/untyped values
+reused outputs preserve actual subtype
+stack operators preserve mirrored types
+computed expressions preserve result types
+mixed incompatible numeric types are rejected
+control-flow joins reject incompatible type stacks
+lexical locals still shadow public members
+explicit member lookup still skips locals
 ```
 
-must consume three qwords and emit one output typed `something` in compiler analysis.
+## Non-goals
 
-### Typed local
+Do not add:
 
-```forth
-[ :f ( something:v -- )
-    v~x
-]
+- runtime type tags;
+- tagged data-stack cells;
+- runtime type lookup or dispatch;
+- compiler signedness/width flags;
+- arithmetic-specific compiler tables;
+- implicit numeric promotion;
+- hidden receivers;
+- new signature modes;
+- typed root fallback;
+- bootstrap field/layout syntax;
+- field-specific runtime machinery.
+
+The compiler should only need to know:
+
+```text
+what type node describes each compile-time stack value?
+what signature does this word declare?
+does the lhs type provide this operator/member?
 ```
 
-must emit existing local-get then compile the generated `x` member; inferred result type is `u8`.
-
-### Pass-through
-
-```forth
-[ :identity ( something:v -- v ) ]
-```
-
-must use existing input/output-local reuse only.
-
-### Namespace member
-
-```forth
-something~whatever
-```
-
-must require only `whatever`'s declared inputs; no implicit owner value exists.
-
-### Pointer-backed layout
-
-A `ptr`-derived owner must generate address-relative field words using ordinary `+` and field-type `@`; a value-backed owner must generate shift/`&` words.
-
-### Limits
-
-Reject value-backed layouts wider than 64 bits, non-byte-aligned address-backed fields in the initial implementation, and recursive-by-value layout cycles.
-
-## 18. Explicit non-goals
-
-Do not add in this pass:
-
-- hidden/preserved receivers;
-- receiver registers or scope-stack receiver values;
-- receiver node flags or signature prefixes;
-- `word_field` or a field-specific runtime evaluator;
-- per-field offset/width payloads;
-- `NODE_SIZE`;
-- static-value node/storage classes;
-- `size`/`mask` declaration keywords;
-- magic inspection/execution of `&` to infer width;
-- automatic `lit` behavior for `mask`;
-- implicit alignment/padding;
-- width-specific kernel field-load primitives;
-- runtime tagged values;
-- runtime value-based dynamic dispatch;
-- stored-pointer field semantics beyond a later explicit type model.
-
-The first implementation should make the existing dictionary, signatures, immediates, locals, type ancestry, and ordinary word execution compose cleanly. New runtime machinery should be added only where existing Hitherto operations cannot express the behavior.
+Everything else belongs to ordinary Hitherto definitions.
