@@ -8,7 +8,6 @@
 .intel_syntax noprefix
 
 .equ DATA_STACK_SIZE, 65536
-.equ TYPE_STACK_SIZE, DATA_STACK_SIZE
 .equ DICT_SIZE, 131072
 .equ DICT_QWORDS, DICT_SIZE / 8
 
@@ -114,17 +113,6 @@ token_buf:
 scope_stack:
     .skip SCOPE_MAX * 8
 scope_stack_end:
-
-# lowest abstract stack address belonging to current definition
-type_stack_base:
-    .quad 0
-# next free abstract stack cell
-type_stack_here:
-    .quad 0
-type_stack:
-    .skip TYPE_STACK_SIZE
-type_stack_end:
-
 data_stack:
     .skip DATA_STACK_SIZE
 data_stack_end:
@@ -157,7 +145,6 @@ native_here:
 .equ P_DIV_ZERO, 11
 .equ P_LOCAL, 12
 .equ P_EOF, 13
-.equ P_TYPE, 14
 
 .equ PANIC_CODE, 0
 .equ PANIC_STATE, 8
@@ -539,7 +526,8 @@ read_token:
     cmp rcx, TOKEN_MAX_LEN
     jge panic_token_overflow
 
-    mov byte ptr [rip + token_buf + rcx], al
+    lea rdx, [rip + token_buf]
+    mov byte ptr [rdx + rcx], al
     inc rcx
 
     call read_char
@@ -935,14 +923,6 @@ compile_child_publish:
     mov rbp, r9
     ret
 
-.macro SIGNATURE_POSITION_COUNT dst, tmp, header
-    mov \dst, [\header]
-    mov \tmp, \dst
-    and \dst, 0xf # input count
-    shr \tmp, 4
-    and \tmp, 0xf # output count
-    add \dst, \tmp
-.endm
 .macro SIGNATURE_LOCAL_COUNT dst, header
     mov \dst, [\header]
     shr \dst, 8
@@ -958,22 +938,18 @@ compile_child_publish:
 # rax = signature header address
 # rdx = local slot 0..7
 signature_append_ref:
-    SIGNATURE_POSITION_COUNT rcx, r8, rax
-    cmp rcx, 8
+
+    # output count determines next ref slot
+    mov rcx, [rax]
+    shr rcx, 4
+    and ecx, 0xf
+    cmp ecx, 8
     jae panic_token_invalid
 
     # refs start at 12, each 3 bits
     lea ecx, [rcx + rcx * 2 + 12]
     shl rdx, cl
     or [rax], rdx
-    ret
-
-# rax = signature header
-# fails if all slots used
-signature_require_position:
-    SIGNATURE_POSITION_COUNT rcx, r8, rax
-    cmp rcx, 8
-    jae panic_token_invalid
     ret
 
 # rsi/r9 = local name
@@ -984,6 +960,7 @@ signature_require_position:
 signature_declare_local:
     push rdi
     push rdx
+
     # validate: may override words but not other locals
     call find_scope
     jc .signature_local_free
@@ -998,7 +975,6 @@ signature_declare_local:
     NODE_NAME_ALIGNED_SIZE rcx, rbp
     lea rax, [rbp + NODE_BODY + rcx + 8]
 
-    call signature_require_position
     SIGNATURE_LOCAL_COUNT r10, rax
 
     push r10
@@ -1008,10 +984,18 @@ signature_declare_local:
     NODE_NAME_ALIGNED_SIZE rcx, rbp
     lea rax, [rbp + NODE_BODY + rcx + 8]
 
+    pop rdi
+
+    # new output local:
+    test edi, 0x10
+    jz .signature_declare_count
+
+    push rdi
     mov rdx, r10
     call signature_append_ref
-
     pop rdi
+
+.signature_declare_count:
     add qword ptr [rax], rdi
     ret
 
@@ -1020,8 +1004,6 @@ signature_declare_local:
 signature_reuse_output:
     NODE_NAME_ALIGNED_SIZE rcx, rbp
     lea rax, [rbp + NODE_BODY + rcx + 8]
-
-    call signature_require_position
 
     mov rdx, r10
     call signature_append_ref
@@ -1075,6 +1057,7 @@ compile_signature:
 
     mov edi, 0x110
     call signature_declare_local
+    jmp .signature_outputs
 
 .signature_output_reuse:
     call find_scope
@@ -1182,188 +1165,6 @@ compile_local:
     # no skip needed.
     ret
 
-# rax = type node, 0 = untyped
-type_stack_push:
-    mov rcx, [rip + type_stack_here]
-    lea rdx, [rip + type_stack_end]
-    cmp rcx, rdx
-    jae panic_stack_overflow
-
-    mov [rcx], rax
-    add rcx, 8
-    mov [rip + type_stack_here], rcx
-    ret
-
-# returns:
-#   rax = type node, 0 = untyped
-type_stack_pop:
-    mov rcx, [rip + type_stack_here]
-    mov r8, [rip + type_stack_base]
-    cmp rcx, r8
-    je panic_stack_underflow
-
-    sub rcx, 8
-    mov [rip + type_stack_here], rcx
-    mov rax, [rcx]
-    ret
-
-# rax = type, 0 untyped
-# rdx = required type, 0 = untyped
-type_require:
-    test rdx, rdx
-    jz .type_require_done
-
-    test rax, rax
-    jz panic_type
-
-.type_require_next:
-    cmp rax, rdx
-    je .type_require_done
-
-    call node_type
-    test rax, rax
-    jnz .type_require_next
-
-    jmp panic_type
-.type_require_done:
-    ret
-
-# rax = called word_exec node
-# preserves rax
-type_stack_apply_signature:
-    push rax
-    mov rsi, rax
-
-    # Load signature.
-    NODE_NAME_ALIGNED_SIZE rcx, rsi
-    mov r11, [rsi + NODE_BODY + rcx + 8]
-
-    # No explicit signature: nothing to validate yet.
-    bt r11, NODE_SIG_PRESENT_BIT
-    jnc .type_sig_done
-
-    # Input count.
-    mov r8d, r11d
-    and r8d, NODE_SIG_INPUT_MASK
-
-    # First input in compiler type stack.
-    mov rdi, [rip + type_stack_here]
-    mov ecx, r8d
-    shl rcx, 3
-    sub rdi, rcx
-
-    cmp rdi, [rip + type_stack_base]
-    jb panic_stack_underflow
-
-    # First signature ref.
-    shr r11, 12
-
-.type_sig_input:
-    test r8d, r8d
-    jz .type_sig_outputs
-
-    mov r10d, r11d
-    and r10d, 7
-
-    # Required type.
-    mov rax, rsi
-    call node_local_slot
-    jc panic_type
-    call node_type
-    mov rdx, rax
-
-    # Actual type.
-    mov rax, [rdi]
-    call type_require
-
-    add rdi, 8
-    shr r11, 3
-    dec r8d
-    jmp .type_sig_input
-
-.type_sig_outputs:
-    # Reload input count and original input base.
-    NODE_NAME_ALIGNED_SIZE rcx, rsi
-    mov rax, [rsi + NODE_BODY + rcx + 8]
-
-    mov r8d, eax
-    and r8d, NODE_SIG_INPUT_MASK
-
-    mov rdi, [rip + type_stack_here]
-    mov ecx, r8d
-    shl rcx, 3
-    sub rdi, rcx
-
-    # Output count.
-    mov r9d, eax
-    and r9d, NODE_SIG_OUTPUT_MASK
-    shr r9d, 4
-
-    # r11 already points at first output ref.
-.type_sig_output:
-    test r9d, r9d
-    jz .type_sig_reclaim
-
-    mov r10d, r11d
-    and r10d, 7
-
-    # Reused input output preserves the actual caller type.
-    cmp r10d, r8d
-    jb .type_sig_output_input
-
-    # Fresh output uses its declared type.
-    mov rax, rsi
-    call node_local_slot
-    jc panic_type
-    call node_type
-    jmp .type_sig_output_stage
-
-.type_sig_output_input:
-    mov rax, [rdi + r10 * 8]
-
-.type_sig_output_stage:
-    push rax
-    shr r11, 3
-    dec r9d
-    jmp .type_sig_output
-
-.type_sig_reclaim:
-    # Consume inputs.
-    mov [rip + type_stack_here], rdi
-
-    # Reload output count.
-    NODE_NAME_ALIGNED_SIZE rcx, rsi
-    mov rax, [rsi + NODE_BODY + rcx + 8]
-    mov r8d, eax
-    and r8d, NODE_SIG_OUTPUT_MASK
-    shr r8d, 4
-
-    test r8d, r8d
-    jz .type_sig_done
-
-    # Staged values are reversed on rsp.
-    lea r9, [rsp + r8 * 8 - 8]
-
-.type_sig_emit:
-    mov rax, [r9]
-    call type_stack_push
-
-    sub r9, 8
-    dec r8d
-    jnz .type_sig_emit
-
-    # r8 is now zero, so recover output count once more to discard staging.
-    NODE_NAME_ALIGNED_SIZE rcx, rsi
-    mov rax, [rsi + NODE_BODY + rcx + 8]
-    mov ecx, eax
-    and ecx, NODE_SIG_OUTPUT_MASK
-    shr ecx, 4
-    lea rsp, [rsp + rcx * 8]
-
-.type_sig_done:
-    pop rax
-    ret
-
 words:
 
 # TOS = P_* panic code
@@ -1439,19 +1240,10 @@ word_ctrl_open:
     mov [rbx], r10
     add rbx, 8
 
-    # preserve parent's abstract stack base
-    mov rax, [rip + type_stack_base]
-    mov [rbx], rax
-    add rbx, 8
-
     mov rdx, rbp
     or rdx, SCOPE_PARENT_TAG
     mov [rbx], rdx
     add rbx, 8
-
-    # child base = parent here
-    mov rax, [rip + type_stack_here]
-    mov [rip + type_stack_base], rax
 
     # compile into child
     mov rbp, rax
@@ -1510,18 +1302,10 @@ word_ctrl_close:
     mov r9, [rbx - 8]
     and r9, -8
 
-    # discard child's abstract stack
-    mov rax, [rip + type_stack_base]
-    mov [rip + type_stack_here], rax
-
-    # restore parent's abstract-stack base
-    mov r10, [rbx - 16]
-    mov [rip + type_stack_base], rax
-
     # parent's skip patch
     # consume skip-ref + tagged parent
-    mov r10, [rbx - 24]
-    sub rbx, 24
+    mov r10, [rbx - 16]
+    sub rbx, 16
 
     call compile_child_publish
     ret
@@ -1638,9 +1422,14 @@ word_lit:
     mov r13, rax
     ret
 
-# Waaaait, why lit and compile_lit?
 # Emits TOS as a runtime literal into the active compile target (word)
+# Ignored during runtime
 word_compile_lit:
+    # exe = value already resolved
+    cmp qword ptr [rip + state], STATE_EXE
+    je .compile_lit_done
+
+    # def = embed value in active target
     call scope_compile_target
     jc panic_state
 
@@ -1656,6 +1445,7 @@ word_compile_lit:
 
     sub r15, 8
     mov r13, [r15]
+.compile_lit_done:
     ret
 
 # [r12] = native entry address
@@ -1995,18 +1785,6 @@ word_to:
     cmp [rax + NODE_CODE], rcx
     jne panic_token_invalid
 
-    # preserve local
-    push rax
-
-    call node_type
-    mov rdx, rax
-
-    # assignment consumes local's type from abstract stack
-    call type_stack_pop
-    call type_require
-
-    pop rax
-
     # emit internal_local_set + owner|slot
     call node_local_binding
     mov [r12 + 8], rax
@@ -2206,11 +1984,8 @@ node_exec_leave:
     test r10, r10
     jz .exec_reclaim
 
-    # shift first output ref to bit zero
-    mov ecx, r11d
-    and ecx, 0xf
-    lea ecx, [rcx + rcx * 2 + 12]
-    shr r11, cl
+    # refs only contain outputs
+    shr r11, 12
 
     # stage outputs before local storage is reclaimed
     mov rsi, r10
@@ -2663,11 +2438,6 @@ eval_token:
     test qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
     jnz .eval_exec
 
-    # apply stack type contract of the signatures
-    push r10
-    call type_stack_apply_signature
-    pop r10
-
     # r10 = 1 means it was resolved with override
     test r10, r10
     jz .eval_compile_static
@@ -2681,14 +2451,6 @@ eval_token:
     ret
 
 .eval_compile_local:
-    # rax = local node
-    push rax
-
-    # local read pushes local's declared type
-    call node_type
-    call type_stack_push
-    
-    pop rax
     call node_local_binding
 
     # emit runtime read + packed owner|slot
@@ -2717,13 +2479,7 @@ eval_token:
     cmp rdx, rcx
     jne .eval_qualified_no_signature
 
-    push r8
-    call type_stack_apply_signature
-    pop r8
-
 .eval_qualified_no_signature:
-    call type_stack_apply_signature
-
     # def: compile a qualified member call
     lea rdx, [rip + internal_member_dispatch]
     mov [r12], rdx
@@ -2838,10 +2594,6 @@ eval_token:
     mov [r12], rax
     mov [r12 + 8], rdx
     add r12, 16
-
-    # runtime lit pushes oneuntyped value
-    xor eax, eax
-    call type_stack_push
     ret
     
 .global _start
@@ -2849,9 +2601,6 @@ _start:
     xor r14d, r14d # dict must be null (0) for first node_add call
     lea r15, [rip + data_stack]
     lea rbx, [rip + scope_stack]
-    lea rax, [rip + type_stack]
-    mov [rip + type_stack_base], rax
-    mov [rip + type_stack_here], rax
 
     # load builtins into dict
 .load_builtins:
@@ -2920,19 +2669,19 @@ _start:
     syscall
 
 panic_dict_notfound:
-    mov eax, P_DICT_NOTFOUND
+    mov rax, P_DICT_NOTFOUND
     jmp panic
 panic_dict_overflow:
-    mov eax, P_DICT_OVERFLOW
+    mov rax, P_DICT_OVERFLOW
     jmp panic
  panic_stack_overflow:
-    mov eax, P_STACK_OVERFLOW
+    mov rax, P_STACK_OVERFLOW
     jmp panic
 panic_stack_underflow:
-    mov eax, P_STACK_UNDERFLOW
+    mov rax, P_STACK_UNDERFLOW
     jmp panic
 panic_token_invalid:
-    mov eax, P_TOKEN_INVALID
+    mov rax, P_TOKEN_INVALID
     jmp panic
 panic_token_overflow:
     mov rax, P_TOKEN_OVERFLOW
@@ -2954,7 +2703,4 @@ panic_local:
     jmp panic
 panic_eof:
     mov rax, P_EOF
-    jmp panic
-panic_type:
-    mov rax, P_TYPE
     jmp panic
