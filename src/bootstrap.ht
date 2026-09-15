@@ -399,71 +399,6 @@
     ]
 ]
 
-# str is a printable memory span (ie. the string type)
-[ memory:str
-    [ addr:ptr
-        ^ @
-        u32~&
-        +
-    ]
-    [ :len
-        @
-        ^
-        32 >>
-        ><
-        u32~&
-        -
-    ]
-    [ :.
-        [ :err 13 panic ]
-        1 # stdout
-        ><
-        span
-        linux~write
-        0 < ? err
-    ]
-]
-
-[ :input
-    [ :data core~io-data ]
-    [ :len core~io-length ]
-
-    [ :span
-        data
-        len @
-    ]
-
-    [ :eof ]
-    [ :error ]
-
-    [ :refill
-        0
-        data
-        8
-        linux~read
-
-        ^ 0 < ? error
-        ^ 0 = ? eof
-
-        len !
-    ]
-    
-    [ :read ( -- u8:v )
-        [
-            len @ 0 = ? refill
-        ]
-
-        data @
-        u8~& to v
-
-        data @ 8 >> data !
-        len @ 1 - len !
-    ]
-]
-[ input:str-parser
-    [ :eof 8 panic ]
-    [ :error 13 panic ]
-]
 
 # arena allocator
 [ :arena
@@ -531,8 +466,8 @@
         ^ seek _
     ]
 ]
-[ :. ( :v -- )
-    [ :err 13 panic ]
+
+[ :output
     [ :buf
         [ :len 32 lit immediate ]
         [ :init
@@ -543,6 +478,103 @@
         ]
         init
     ]
+]
+
+[ :input
+    [ :data core~io-data ]
+    [ :len core~io-length ]
+
+    [ :span
+        data
+        len @
+    ]
+
+    [ :eof ]
+    [ :error ]
+
+    [ :refill
+        0
+        data
+        8
+        linux~read
+
+        ^ 0 < ? error
+        ^ 0 = ? eof
+
+        len !
+    ]
+    
+    [ :read ( -- u8:v )
+        [
+            len @ 0 = ? refill
+        ]
+
+        data @
+        u8~& to v
+
+        data @ 8 >> data !
+        len @ 1 - len !
+    ]
+]
+[ input:str-parser
+    [ :eof 8 panic ]
+    [ :error 13 panic ]
+]
+
+[ b8:ascii
+    [ :code
+        [ :\n 10 lit immediate ]
+        [ :" 34 lit immediate ]
+        [ :0 48 lit immediate ]
+        [ :- 45 lit immediate ]
+    ]
+
+    [ :. ( b8:v -- )
+        [ :err 13 panic ]
+
+        v output~buf
+        u8~!
+
+        1 # stdout
+        output~buf
+        1 # len
+        linux~write
+        ^ 0 < ? err
+    ]
+]
+
+# str is a printable memory span (ie. the string type)
+[ memory:str
+    [ addr:ptr
+        ^ @
+        u32~&
+        +
+    ]
+    [ :len
+        @
+        ^
+        32 >>
+        ><
+        u32~&
+        -
+    ]
+    [ :.
+        [ :err 13 panic ]
+        1 # stdout
+        ><
+        span
+        linux~write
+        0 < ? err
+    ]
+    [ :.\n
+        .
+        ascii~code~\n
+        ascii~.
+    ]
+]
+
+[ :. ( :v -- )
+    [ :err 13 panic ]
     [ :digits ( :n addr:p -- p :len )
         [ :done ]
 
@@ -554,7 +586,7 @@
             # signed remainder -> digit
             ^ 0 < 2 *
             <^ * -
-            48 # = '0'
+            ascii~code~0
             +
 
             p 1 - to p
@@ -568,22 +600,22 @@
     ]
     [ :sign ( addr:p :len -- p len )
         p 1 - to p
-        45 # '-'
+        ascii~code~-
         p u8~!
-        len ! + to len
+        len 1 + to len
     ]
     
+    1 # stdout for syscall before formatting
+    
     v
-    buf buf~len +
+    output~buf output~buf~len +
     digits
 
     [
         v 0 < ? sign
     ]
     
-    # stack: start len
-    1 # stdout
-    >< ><
+    # stack: fd start len
     linux~write
 
     ^ 0 < ? err
@@ -671,58 +703,59 @@
 
 [ :frame
     [ :code ( frame:f -- :v )
+        f
         @
         to v
     ]
-    [ :state ( -- :v )
-        8 +
-        @
-        to v
-    ]
-
-    [ :definition ( -- node:v )
-        16 +
+    [ :state ( frame:f -- :v )
+        f 8 +
         @
         to v
     ]
 
-    [ :scope ( -- :v )
-        24 +
+    [ :definition ( frame:f -- node:v )
+        f 16 +
         @
         to v
     ]
 
-    [ :instruction ( -- :v )
-        32 +
+    [ :scope ( frame:f -- :v )
+        f 24 +
         @
         to v
     ]
 
-    [ :tos ( -- :v )
-        40 +
+    [ :instruction ( frame:f -- :v )
+        f 32 +
         @
         to v
     ]
 
-    [ :dictionary ( -- node:v )
-        48 +
+    [ :tos ( frame:f -- :v )
+        f 40 +
         @
         to v
     ]
 
-    [ :data-stack ( -- :v )
+    [ :dictionary ( frame:f -- node:v )
+        f 48 +
+        @
+        to v
+    ]
+
+    [ :data-stack ( frame:f -- :v )
         56 +
         @
         to v
     ]
 
-    [ :native-stack ( -- :v )
+    [ :native-stack ( frame:f -- :v )
         64 +
         @
         to v
     ]
 
-    [ :code-desc ( -- str:v )
+    [ :code-desc ( frame:f -- str:v )
         [ :panic-state "Invalid state" ]
         [ :panic-dict-notfound "Key in dictionary not found" ]
         [ :panic-dict-overflow "Dictionary overflow" ]
@@ -737,7 +770,7 @@
         [ :panic-local "Invalid local" ]
         [ :panic-unhandled "Unhandled" ]
 
-        code @
+        f code
         [
             ^ 1 = ? panic-state 
             ^ 2 = ? panic-dict-notfound
@@ -758,25 +791,37 @@
 ]
 
 [ :debugger ( frame:f -- )
-    
     "Panic: " str~.
     f frame~code-desc str~.
+    ascii~code~\n
+    ascii~.
 
     "State: " str~.
-    f frame~state @ .
+    f frame~state .
+    ascii~code~\n
+    ascii~.
 
     "Definition: " str~.
-    f frame~definition @ .
+    f frame~definition .
+    ascii~code~\n
+    ascii~.
 
     "Instruction: " str~.
-    f frame~instruction @ .
+    f frame~instruction .
+    ascii~code~\n
+    ascii~.
 
     "TOS: " str~.
-    f frame~tos @ .
+    f frame~tos .
+    ascii~code~\n
+    ascii~.
 ]
 
 ' debugger core~panic-handler !
 
 "Loaded" str~.
+
+# test underflow panic
+_
 
 # must end on newline

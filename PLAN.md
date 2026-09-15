@@ -9,19 +9,11 @@ Keep runtime typing at zero cost.
 - Numeric width/signedness semantics live in Hitherto type members, using `asm` where machine behavior differs.
 - The compiler tracks only type-node pointers while compiling; no runtime type metadata or dispatch is emitted.
 - The compiler knows nothing about signedness, widths, `DIV`/`IDIV`, `SHR`/`SAR`, etc. It only resolves members and validates signatures.
-- Field/layout sugar is deferred to the future Hitherto-hosted compiler.
 
 ## 1. Existing foundations
 
-Already implemented:
-
-1. `parse_hex` defect fix.
-2. Lexical `self` resolution.
-3. Lexical locals vs public/inherited member lookup.
-
 Keep these invariants:
 
-- `self` is only a lexical type alias.
 - Signatures are the only invocation contract.
 - Runtime values have no hidden receiver or type tag.
 - Public member lookup skips locals and follows `NODE_TYPE` ancestry.
@@ -277,7 +269,7 @@ Concrete accessors can already be written using ordinary Hitherto:
 
 ```forth
 [ i8:x
-    ( self:v -- i8:o )
+    ( i8:v -- i8:o )
     v 8 mask field & to o
 ]
 ```
@@ -319,26 +311,6 @@ Keep syscall ABI lowering separate from Hitherto value abstractions.
 11. Defer field/layout sugar to the hosted compiler.
 12. Optimize only after semantics are stable.
 
-## 14. Required tests
-
-Verify at minimum:
-
-```text
-signed/unsigned narrow canonicalization
-signed/unsigned narrow loads
-u64 vs i64 division
-u64 vs i64 comparison
-u64 SHR vs i64 SAR
-no root fallback for known typed operators
-root builtins still work for unknown/untyped values
-reused outputs preserve actual subtype
-stack operators preserve mirrored types
-computed expressions preserve result types
-mixed incompatible numeric types are rejected
-control-flow joins reject incompatible type stacks
-lexical locals still shadow public members
-explicit member lookup still skips locals
-```
 
 ## Non-goals
 

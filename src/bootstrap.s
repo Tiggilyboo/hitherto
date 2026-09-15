@@ -106,6 +106,8 @@ core_end:
 .align 8
 state:
     .quad 0
+panic_active:
+    .quad 0
 token_buf:
     .skip TOKEN_MAX_LEN
 
@@ -177,6 +179,11 @@ panic:
     mov [rsp + PANIC_RSP], rcx
 
 panic_dispatch:
+    # prevent resursive panic attacks
+    cmp qword ptr [rip + panic_active], 0
+    jne .panic_exit
+    mov qword ptr [rip + panic_active], 1
+
     mov rax, [rip + panic_handler]
     test rax, rax
     jz .panic_exit
@@ -370,15 +377,16 @@ parse_hex:
     stc
     ret
 
-# rsi = token address
-# r9 = token length
+# rsi = name address
+# r9 = name length
+# Splits once at the first '~'
 # returns:
-#  rax = scope address
-#  r8 = scope length
-#  rsi = member address
-#  r9 = member length
-#  CF = 0 valid
-#  CF = 1 invalid
+#  rax = head address
+#  r8 = head length
+#  rsi = tail address
+#  r9 = tail length
+#  CF = 0 split found
+#  CF = 1 no split found
 parse_member:
     xor ecx, ecx
 
@@ -393,36 +401,22 @@ parse_member:
     jmp .member_scan
 
 .member_split:
-    # scope non-empty
+    # head non-empty
     test rcx, rcx
     je .member_invalid
-    # member must not be empty
+
+    # tail must not be empty
     lea rdx, [rcx + 1]
     cmp rdx, r9
     je .member_invalid
 
-    # preserve scope length
-    mov r8, rcx
-    mov rcx, rdx
-
-.member_tail:
-    cmp rcx, r9
-    jz .member_done
-
-    # TODO: only one scope member jump for now
-    cmp byte ptr [rsi + rcx], '~'
-    je .member_invalid
-
-    inc rcx
-    jmp .member_tail
-    
-.member_done:
     mov rax, rsi
-    lea rsi, [rsi + r8 + 1]
-    sub r9, r8
-    dec r9
+    mov r8, rcx
+    add rsi, rdx
+    sub r9, rdx
     clc
     ret
+
 .member_invalid:
     stc
     ret
@@ -2154,6 +2148,64 @@ find_member:
     stc
     ret
 
+# r8 = resolved current scope node
+# rsi = remaining qualified chain
+# r9 = remaining chain length
+# Walks zero or more intermediate member scopes
+# returns:
+#   rax = final member node
+#   r8 = immediate parent of final member
+#   CF = 0 found
+#   CF = 1 not
+find_member_chain:
+    # rsp = scope
+    # rsp + 8 = tail address
+    # rsp + 16 = remaining tail len
+    sub rsp, 24
+    mov [rsp], r8
+
+.member_chain_next:
+    # failure means rsi/r9 is the final segment.
+    call parse_member
+    jc .member_chain_final
+
+    # Save the tail while resolving this segment.
+    mov [rsp + 8], rsi
+    mov [rsp + 16], r9
+
+    # Resolve this segment inside current scope.
+    mov rsi, rax
+    mov r9, r8
+    mov r8, [rsp]
+
+    call find_member
+    jc .member_chain_missing
+
+    # Resolved member becomes the scope for the next segment.
+    mov [rsp], rax
+
+    mov rsi, [rsp + 8]
+    mov r9, [rsp + 16]
+    jmp .member_chain_next
+    
+.member_chain_final:
+    # rsi/r9 = final member name
+    mov r8, [rsp]
+    # '~' missing and is final member name
+    call find_member
+    jc .member_chain_missing
+
+    # r8 can be clobbered
+    mov r8, [rsp]
+    add rsp, 24
+    clc
+    ret
+
+.member_chain_missing:
+    add rsp, 24
+    stc
+    ret
+
 # returns:
 #   rax = context node of the innermost active qualified member call, 0 if none
 scope_context:
@@ -2396,14 +2448,12 @@ eval_token:
     call find_scope
     jnc .eval_word
 
-    # then try scope~member
+    # then try scope~member chain
     call parse_member
     jc .eval_literal
 
-    # rax = context name
-    # r8 = context name len
-    # rsi = member name
-    # r9 = member name len
+    # rax/r8 = root scope nam / len
+    # rsi/r9 = remaining member chain name / len
     push rsi
     push r9
     mov rsi, rax
@@ -2413,11 +2463,9 @@ eval_token:
     pop rsi
     jc panic_dict_notfound
 
-    # resolve member through context chain
+    # resolve member segments
     mov r8, rax
-    push r8
-    call find_member
-    pop r8
+    call find_member_chain
     jc panic_dict_notfound
 
     # rax = resolved member
