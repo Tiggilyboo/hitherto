@@ -39,6 +39,8 @@
 .equ SCOPE_COMPILE_TAG, 4
 
 .section .rodata
+bootstrap_file_path:
+    .asciz "bootstrap.ht"
 
 token_ctrl_open:
     .asciz "["
@@ -66,6 +68,8 @@ token_to:
     .asciz "to"
 token_panic:
     .asciz "panic"
+token_source:
+    .asciz "source"
 
 .align 8
 internal_lit:
@@ -96,9 +100,17 @@ internal_local_set:
 core:
 panic_handler:
     .quad 0
-io_data:
+argc:
     .quad 0
-io_length:
+argv:
+    .quad 0
+source_fd:
+    .quad 0
+source_dirfd:
+    .quad 0
+source_data:
+    .quad 0
+source_len:
     .quad 0
 core_end:
 
@@ -211,35 +223,28 @@ panic_dispatch:
 #   CF = 0 success
 #   CF = 1 EOF
 read_char:
-    cmp qword ptr [rip + io_length], 0
+    cmp qword ptr [rip + source_len], 0
     jne .read_char_cached
 
-    # refill up to one qword
-    push rcx
-
     xor eax, eax # SYS_read
-    xor edi, edi # stdin
-    lea rsi, [rip + io_data]
+    mov edi, dword ptr [rip + source_fd]
+    lea rsi, [rip + source_data]
     mov edx, 8
     syscall
 
-    pop rcx
-
-    # zero = EOF, negative = error
     test rax, rax
     js .read_char_error
     jz .read_char_eof
 
-    mov [rip + io_length], rax
+    mov [rip + source_len], rax
 
 .read_char_cached:
-    # little-endian: next byte is always the low byte
-    movzx eax, byte ptr [rip + io_data]
-    shr qword ptr [rip + io_data], 8
-    dec qword ptr [rip + io_length]
-
+    movzx eax, byte ptr [rip + source_data]
+    shr qword ptr [rip + source_data], 8
+    dec qword ptr [rip + source_len]
     clc
     ret
+
 .read_char_error:
     mov rax, P_STATE
     jmp panic
@@ -485,7 +490,7 @@ parse_literal:
 # rsi = token address
 # r9 = token length
 read_token:
-    xor rcx, rcx
+    xor r10d, r10d
 .skip_ws:
     call read_char
     jc .token_eof
@@ -499,10 +504,8 @@ read_token:
     cmp al, byte ptr [rip + token_ign]
     je .skip_comment
 
-    # quote belongs to the next word, do not consume next
-    cmp al, '"'
-    je .single
-    jmp .next
+    # first token charactir is already loaded
+    jmp .append_read
 
 .skip_comment:
     call read_char
@@ -511,19 +514,19 @@ read_token:
     jne .skip_comment
     jmp .skip_ws
 
-.single:
-    mov byte ptr [rip + token_buf], al
-    mov rcx, 1
-    jmp .done
-
-.next:
-    cmp rcx, TOKEN_MAX_LEN
+.append_read:
+    cmp r10, TOKEN_MAX_LEN
     jge panic_token_overflow
 
     lea rdx, [rip + token_buf]
-    mov byte ptr [rdx + rcx], al
-    inc rcx
+    mov byte ptr [rdx + r10], al
+    inc r10
 
+    # quote terminates a token but prefixes to it
+    cmp al, '"'
+    je .done
+
+.next:
     call read_char
     jc .done
 
@@ -533,14 +536,15 @@ read_token:
     je .done
     cmp al, '\n'
     je .done
-    jmp .next
+    jmp .append_read
 
 .done:
     lea rsi, [rip + token_buf]
-    mov r9, rcx
+    mov r9, r10
     xor eax, eax
     clc
     ret
+
 .token_eof:
     stc
     ret
@@ -1788,6 +1792,15 @@ word_to:
     add r12, 16
     ret
 
+word_source:
+.eval_source_next:
+    call read_token
+    jc .eval_source_done
+    call eval_token
+    jmp .eval_source_next
+.eval_source_done:
+    ret
+
 words_end:
 
 # rdx = node
@@ -1839,6 +1852,30 @@ node_exec_set_code_start:
     or [rcx], rdx
     ret
 
+scope_body_floor:
+    mov rcx, rbx
+    lea rdx, [rip + scope_stack]
+.scope_body_floor_next:
+    cmp rcx, rdx
+    je .scope_body_floor_root
+
+    sub rcx, 8
+    mov rax, [rcx]
+
+    test rax, rax
+    jns .scope_body_floor_next
+
+    shr rax, 39
+    and eax, 0x3fff
+
+    lea rdx, [rip + data_stack]
+    lea rax, [rdx + rax * 8]
+    ret
+
+.scope_body_floor_root:
+    lea rax, [rip + data_stack]
+    ret
+
 # rbp = word_exec node
 # returns:
 #   r11 = signature header
@@ -1872,8 +1909,8 @@ node_exec_enter:
     mov r10, r15
     sub r10, rcx
 
-    lea rcx, [rip + data_stack]
-    cmp r10, rcx
+    call scope_body_floor
+    cmp r10, rax
     jb panic_stack_underflow
 
     # rdx = local base
@@ -1900,6 +1937,13 @@ node_exec_enter:
     sub rdx, rsi
     shl rdx, 14
     or rax, rdx
+
+    # body-floor qword index in bits 39..52
+    mov rcx, r9
+    sub rcx, rsi
+    shr rcx, 3
+    shl rcx, 39
+    or rax, rcx
 
     # initial validity mask = (1 << input_count) - 1
     mov ecx, r8d
@@ -2643,10 +2687,20 @@ eval_token:
     mov [r12 + 8], rdx
     add r12, 16
     ret
-    
+
 .global _start
 _start:
-    xor r14d, r14d # dict must be null (0) for first node_add call
+    # rsp = argc
+    # rsp + 8... = argv...
+    mov rax, [rsp]
+    mov [rip + argc], rax
+    lea rax, [rsp + 8]
+    mov [rip + argv], rax
+
+    # dict must be null (0) for first node_add call
+    xor r14d, r14d 
+
+    # bind runtime stacks
     lea r15, [rip + data_stack]
     lea rbx, [rip + scope_stack]
 
@@ -2673,6 +2727,9 @@ _start:
     call dict_add_z
     lea rsi, [rip + token_panic]
     lea rdi, [rip + word_panic]
+    call dict_add_z
+    lea rsi, [rip + token_source]
+    lea rdi, [rip + word_source]
     call dict_add_z
 
     # immediates
@@ -2706,14 +2763,26 @@ _start:
     call dict_add_z
     or qword ptr [rax + NODE_TYPE], NODE_IMMEDIATE_MASK
 
-.repl_loop:
-    call read_token
-    jc .repl_eof
-    call eval_token
-    jmp .repl_loop
-.repl_eof:
+    mov eax, 257  # SYS_OPENAT
+    mov edi, -100 # AT_FDCWD
+    lea rsi, [rip + bootstrap_file_path]
+    mov edx, 0x80000    # O_RDONLY | O_CLOEXEC
+    xor r10d, r10d
+    syscall
+
+    test rax, rax
+    js panic_state
+
+    mov [rip + source_fd], rax
+    mov qword ptr [rip + source_dirfd], -100 # AT_FDCWD
+    mov qword ptr [rip + source_len], 0
+
+    # evaluate current source (we just loaded bootstrap.ht)
+    call word_source
+
+    # exit
     xor edi, edi
-    mov rax, 60
+    mov eax, 60
     syscall
 
 panic_dict_notfound:

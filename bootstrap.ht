@@ -151,9 +151,13 @@
 
 # words which point to internal core qword addresses in kernel
 [ :core
-    [ :panic-handler $0 ]
-    [ :io-data $1 ]
-    [ :io-length $2 ]
+    [ :panic-handler $0 lit immediate ]
+    [ :argc $1 lit immediate ]
+    [ :argv $2 lit immediate ]
+    [ :source-fd $3 lit immediate ]
+    [ :source-dirfd $4 lit immediate ]
+    [ :source-data $5 lit immediate ]
+    [ :source-len $6 lit immediate ]
 ]
 
 # address is the value of a pointer
@@ -379,6 +383,14 @@
         sys
         to fd
     ]
+
+    [ :close ( :fd -- :result )
+        3
+        fd
+        0 0 0 0 0
+        sys
+        to result
+    ]
     
     [ :exit ( u32:code  -- )
         60 code
@@ -396,6 +408,18 @@
         offset
         sys
         to result
+    ]
+
+    [ :openat ( :dirfd addr:path :flags :mode -- :fd )
+        257
+        dirfd
+        path
+        flags
+        mode
+        0
+        0
+        sys
+        to fd
     ]
 ]
 
@@ -481,8 +505,8 @@
 ]
 
 [ :input
-    [ :data core~io-data ]
-    [ :len core~io-length ]
+    [ :data core~source-data ]
+    [ :len core~source-len ]
 
     [ :span
         data
@@ -493,7 +517,7 @@
     [ :error ]
 
     [ :refill
-        0
+        core~source-fd @
         data
         8
         linux~read
@@ -540,6 +564,10 @@
         1 # len
         linux~write
         ^ 0 < ? err
+    ]
+    [ :.\n ( -- )
+        code~\n
+        .
     ]
 ]
 
@@ -623,7 +651,7 @@
 ]
 
 # String literals
-[ :"
+[ :quoted-str
     [ :overflow 3 panic ]
 
     [ :done ( str:s u8:c -- s )
@@ -632,6 +660,15 @@
         32 <<
         8 |
         s !
+
+        # fs calls not part of str len
+        0
+        arena~cursor
+        u8~!
+
+        arena~cursor
+        1 +
+        arena~seek
     ]
 
     # reserve qword length
@@ -659,7 +696,10 @@
 
         ~[
     ]
+]
 
+[ :"
+    quoted-str
     lit
     immediate
 ]
@@ -744,13 +784,13 @@
     ]
 
     [ :data-stack ( frame:f -- :v )
-        56 +
+        f 56 +
         @
         to v
     ]
 
     [ :native-stack ( frame:f -- :v )
-        64 +
+        f 64 +
         @
         to v
     ]
@@ -793,33 +833,67 @@
 [ :debugger ( frame:f -- )
     "Panic: " str~.
     f frame~code-desc str~.
-    ascii~code~\n
-    ascii~.
+    ascii~.\n
 
     "State: " str~.
     f frame~state .
-    ascii~code~\n
-    ascii~.
+    ascii~.\n
 
     "Definition: " str~.
     f frame~definition .
-    ascii~code~\n
-    ascii~.
+    ascii~.\n
 
     "Instruction: " str~.
     f frame~instruction .
-    ascii~code~\n
-    ascii~.
+    ascii~.\n
 
     "TOS: " str~.
     f frame~tos .
-    ascii~code~\n
-    ascii~.
+    ascii~.\n
 ]
 
 ' debugger core~panic-handler !
 
-"Loaded" str~.
+"Loaded debugger" str~.\n
+
+[ :~"
+    [ :err 13 panic ]
+    [ :eval ( :child-fd :parent-fd :parent-dirfd :parent-data :parent-len -- )
+        child-fd core~source-fd !
+        parent-dirfd core~source-dirfd !
+        0 core~source-data !
+        0 core~source-len !
+        source
+
+        parent-fd core~source-fd !
+        parent-dirfd core~source-dirfd !
+        parent-data core~source-data !
+        parent-len core~source-len !
+
+        child-fd linux~close
+        0 < ? err
+    ]
+
+    quoted-str
+
+    ^
+    str~ptr
+    core~source-dirfd @
+    ><
+
+    0 0 linux~openat
+    [ ^ 0 < ? err ]
+    >< _ # path child-fd => child-fd
+
+    core~source-fd @
+    core~source-dirfd @
+    core~source-data @
+    core~source-len @
+    eval
+    immediate
+]
+
+~"test.ht"
 
 # test underflow panic
 _

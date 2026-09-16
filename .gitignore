@@ -1,3 +1,4 @@
 *.o
 *.a
 hitherto
+tree-sitter-hitherto/src/
