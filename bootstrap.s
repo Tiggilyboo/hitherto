@@ -491,11 +491,12 @@ parse_literal:
 # r9 = token length
 read_token:
     xor r10d, r10d
+
 .skip_ws:
     call read_char
     jc .token_eof
 
-    cmp al, ' ' 
+    cmp al, ' '
     je .skip_ws
     cmp al, '\t'
     je .skip_ws
@@ -504,8 +505,10 @@ read_token:
     cmp al, byte ptr [rip + token_ign]
     je .skip_comment
 
-    # first token charactir is already loaded
-    jmp .append_read
+    cmp al, '"'
+    je .single
+
+    jmp .next
 
 .skip_comment:
     call read_char
@@ -514,7 +517,12 @@ read_token:
     jne .skip_comment
     jmp .skip_ws
 
-.append_read:
+.single:
+    mov byte ptr [rip + token_buf], al
+    mov r10, 1
+    jmp .done
+
+.next:
     cmp r10, TOKEN_MAX_LEN
     jge panic_token_overflow
 
@@ -522,21 +530,17 @@ read_token:
     mov byte ptr [rdx + r10], al
     inc r10
 
-    # quote terminates a token but prefixes to it
-    cmp al, '"'
-    je .done
-
-.next:
     call read_char
     jc .done
 
-    cmp al, ' ' 
+    cmp al, ' '
     je .done
     cmp al, '\t'
     je .done
     cmp al, '\n'
     je .done
-    jmp .append_read
+
+    jmp .next
 
 .done:
     lea rsi, [rip + token_buf]
@@ -1263,6 +1267,10 @@ word_ctrl_close:
     cmp rbx, r8
     je panic_token_noopen
 
+    # recursive source cannot close it's caller's definition
+    cmp qword ptr [rbx - 8], SCOPE_COMPILE_TAG
+    je panic_token_noopen
+
     # runtime fall-through leaves region
     lea rax, [rip + internal_ctrl_pop]
     mov [r12], rax
@@ -1473,6 +1481,10 @@ word_ctrl_pop:
     cmp rbx, rcx
     je .ctrl_pop_empty
 
+    # stop at recursive source boundary
+    cmp qword ptr [rbx - 8], SCOPE_COMPILE_TAG
+    je .ctrl_pop_empty
+
     sub rbx, 8
     mov rax, [rbx]
     clc
@@ -1484,6 +1496,10 @@ word_ctrl_pop:
 word_loop:
     lea rcx, [rip + scope_stack]
     cmp rbx, rcx
+    je panic_token_noopen
+
+    # do not loop into caller's compile scope
+    cmp qword ptr [rbx - 8], SCOPE_COMPILE_TAG
     je panic_token_noopen
 
     # peek start offset
@@ -1571,6 +1587,10 @@ word_asm:
 
     lea rcx, [rip + scope_stack]
     cmp rbx, rcx
+    je panic_token_noopen
+
+    # asm can't run in a compile scope (must be it's own anonymous one)
+    cmp qword ptr [rbx - 8], SCOPE_COMPILE_TAG
     je panic_token_noopen
 
     # top scope entry is current scope
@@ -1793,6 +1813,42 @@ word_to:
     ret
 
 word_source:
+    cmp qword ptr [rip + state], STATE_DEF
+    jne .eval_source
+
+    # comp time - find def of parent
+    call scope_compile_target
+    jc panic_state
+
+    # rax = compile target
+    # rdx = adress of target|SCOPE_COMPILE_TAG entry
+    push rbp
+    push r12
+    push rbx
+
+    # re-enter evaluator as target def
+    mov rbp, rax
+    mov r12, [rax + NODE_END]
+
+    # put recursive compile target bounary above every active caller frame
+    lea rcx, [rip + scope_stack_end]
+    cmp rbx, rcx
+    jae panic_stack_overflow
+
+    mov qword ptr [rbx], SCOPE_COMPILE_TAG
+    add rbx, 8
+
+    call .eval_source
+
+    # publish where recursive compilation finished
+    mov [rbp + NODE_END], r12
+
+    pop rbx
+    pop r12
+    pop rbp
+    ret
+    
+.eval_source:
 .eval_source_next:
     call read_token
     jc .eval_source_done
@@ -2310,8 +2366,10 @@ scope_invocation_frame:
 
 # returns:
 #   rax = node currently receiving compile time output
+#   rdx = address of it's SCOPE_COMPILE_TAG stack entry
 #   CF = 0 found
 #   CF = 1 not found
+# Recursive source boundary: compile target should not cross it
 scope_compile_target:
     mov rcx, rbx
     lea rdx, [rip + scope_stack]
@@ -2324,9 +2382,15 @@ scope_compile_target:
     test rax, SCOPE_COMPILE_TAG
     jz .compile_target_next
 
+    # recursive source boundary = bare tag
+    cmp rax, SCOPE_COMPILE_TAG
+    je .compile_target_missing
+
+    # strip tag
     and rax, -8
     clc
     ret
+
 .compile_target_missing:
     stc
     ret

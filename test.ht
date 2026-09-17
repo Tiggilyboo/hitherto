@@ -1,1 +1,8 @@
-"Hello Import!" str~.
+"Hello Import!" str~.\n
+
+[ :imported-word ( u32:a -- u16:b )
+    a u16~&
+    ascii~.\n
+    to b
+]
+

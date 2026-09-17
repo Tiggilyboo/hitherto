@@ -337,9 +337,7 @@
         ]
     ]
 ]
-[ b64:i64
-    # passthrough: builtins already do this
-]
+[ b64:i64 ]
 
 # Defines an arbitrary segment of memory
 [ :memory
@@ -391,6 +389,15 @@
         sys
         to result
     ]
+
+    [ :fstat ( :fd addr:stat -- :result )
+        5
+        fd
+        stat
+        0 0 0 0
+        sys
+        to result
+    ]
     
     [ :exit ( u32:code  -- )
         60 code
@@ -410,7 +417,7 @@
         to result
     ]
 
-    [ :openat ( :dirfd addr:path :flags :mode -- :fd )
+    [ :openat ( :dirfd addr:path u32:flags u32:mode -- :fd )
         257
         dirfd
         path
@@ -422,7 +429,6 @@
         to fd
     ]
 ]
-
 
 # arena allocator
 [ :arena
@@ -548,6 +554,7 @@
 [ b8:ascii
     [ :code
         [ :\n 10 lit immediate ]
+        [ :space 32 lit immediate ]
         [ :" 34 lit immediate ]
         [ :0 48 lit immediate ]
         [ :- 45 lit immediate ]
@@ -660,18 +667,8 @@
         32 <<
         8 |
         s !
-
-        # fs calls not part of str len
-        0
-        arena~cursor
-        u8~!
-
-        arena~cursor
-        1 +
-        arena~seek
     ]
 
-    # reserve qword length
     8 arena~alloc
 
     [
@@ -684,7 +681,7 @@
         str-parser~read
 
         # check if character is "
-        ^ 34 = ? done
+        ^ ascii~code~" = ? done
 
         # str char cursor -> str
         arena~cursor
@@ -700,6 +697,26 @@
 
 [ :"
     quoted-str
+    lit
+    immediate
+]
+
+
+# cstr is null terminated str usually used for C ffi
+[ str:cstr ]
+
+[ :quoted-cstr
+    quoted-str
+
+    # null terminated
+    0 arena~cursor u8~!
+    arena~cursor
+    1 +
+    arena~seek
+]
+
+[ :c"
+    quoted-cstr
     lit
     immediate
 ]
@@ -856,46 +873,165 @@
 
 "Loaded debugger" str~.\n
 
-[ :~"
-    [ :err 13 panic ]
-    [ :eval ( :child-fd :parent-fd :parent-dirfd :parent-data :parent-len -- )
-        child-fd core~source-fd !
-        parent-dirfd core~source-dirfd !
-        0 core~source-data !
-        0 core~source-len !
-        source
+[ :module
+    [ memory:record
+        [ :len 24 lit immediate ]
 
-        parent-fd core~source-fd !
-        parent-dirfd core~source-dirfd !
-        parent-data core~source-data !
-        parent-len core~source-len !
-
-        child-fd linux~close
-        0 < ? err
+        [ :next ( record:r -- addr:p )
+            r to p
+        ]
+        [ :dev ( record:r -- addr:p )
+            r 8 +
+            to p
+        ]
+        [ :ino ( record:r -- addr:p )
+            r 16 +
+            to p
+        ]
+    ]
+    
+    # to track all module imports
+    [ :registry
+        [ :init
+            8 arena~alloc
+            ^ 0 >< ! # preserve head = 0
+            lit
+            immediate
+        ]
+        init
     ]
 
-    quoted-str
+    [ :find ( :dev :ino -- record:r )
+        [ :done ]
+        registry @ to r
 
-    ^
-    str~ptr
-    core~source-dirfd @
-    ><
+        [
+            r 0 = ? done
+            r record~dev @
+            dev =
 
-    0 0 linux~openat
-    [ ^ 0 < ? err ]
-    >< _ # path child-fd => child-fd
+            r record~ino @
+            ino =
 
-    core~source-fd @
-    core~source-dirfd @
-    core~source-data @
-    core~source-len @
-    eval
-    immediate
+            & ? done
+
+            r record~next @
+            to r
+
+            ~[
+        ]
+    ]
+
+    [ :store ( :dev :ino record:r -- )
+        registry @
+        r record~next
+        !
+
+        dev
+        r record~dev
+        !
+
+        ino
+        r record~ino
+        !
+
+        r registry !
+    ]
+
+    [ :claim ( :dev :ino -- )
+        [ :err-dup 14 panic ]
+
+        dev ino find
+        0 =
+        0 =
+        ? err-dup
+
+        dev ino
+        record~len arena~alloc
+        store
+    ]
+
+    # parse path string following import
+    [ :import
+        [ :invalid 6 panic ]
+        [ :overflow 3 panic ]
+        [ :file-flags 0x80000 lit immediate ] # O_CLOEXEC
+
+        [ :path
+            str-parser~read
+            ^ ascii~code~" =
+            0 =
+            ? invalid
+            _
+
+            # consume everything until closing "
+            quoted-str
+
+            arena~cursor
+            ^ arena~end < 0 = ? overflow
+            _
+
+            # Reserve terminator
+            0
+            arena~cursor
+            u8~!
+
+            arena~cursor
+            1 +
+            arena~seek
+        ]
+
+        [ :consume ( :child-fd :saved-fd :saved-data :saved-len -- )
+            child-fd core~source-fd !
+            0 core~source-data !
+            0 core~source-len !
+            source
+
+            # restore parent
+            saved-fd core~source-fd !
+            saved-data core~source-data !
+            saved-len core~source-len !
+
+            child-fd linux~close
+            0 < ? invalid
+        ]
+
+        # import body continues
+        arena~cursor
+        path
+
+        # Resolve imports against current directory
+        core~source-dirfd @
+        ><
+        
+        str~ptr
+        file-flags
+        0
+        linux~openat
+
+        # stack: path fd
+        ^ 0 < ? invalid
+
+        # discard path, keep fd
+        ><
+        arena~seek
+
+        # TODO: Different directory that same file
+
+        # stack: child-fd
+        core~source-fd @
+        core~source-data @
+        core~source-len @
+
+        consume
+        
+        immediate
+    ]
 ]
 
-~"test.ht"
+[ module:test import "test.ht" ]
 
-# test underflow panic
-_
-
-# must end on newline
+test
+0x12345678 test~imported-word
+.
+ascii~.\n
