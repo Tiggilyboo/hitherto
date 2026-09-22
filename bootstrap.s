@@ -69,27 +69,8 @@ token_panic:
 token_source:
     .asciz "source"
 
-.align 8
-internal_lit:
-    .quad word_lit
-internal_branch:
-    .quad word_branch_runtime
-internal_ctrl_push:
-    .quad word_ctrl_push
-internal_ctrl_pop:
-    .quad word_ctrl_pop
-internal_skip:
-    .quad word_skip
-internal_native:
-    .quad word_native
-internal_member_dispatch:
-    .quad word_member_dispatch
-internal_local_get:
-    .quad word_local_get
-internal_local_set:
-    .quad word_local_set
 
-.section .bss
+.section .data
 
 .align 8
 
@@ -110,7 +91,41 @@ source_data:
     .quad 0
 source_len:
     .quad 0
+
+dict_base:
+    .quad 0
+dict_end_ptr:
+    .quad 0
+dict_tail_get:
+    .quad word_dict_tail_get
+dict_tail_set:
+    .quad word_dict_tail_set
+
+.align 8
+internal_lit:
+    .quad word_lit
+internal_branch:
+    .quad word_branch_runtime
+internal_ctrl_push:
+    .quad word_ctrl_push
+internal_ctrl_pop:
+    .quad word_ctrl_pop
+internal_skip:
+    .quad word_skip
+internal_native:
+    .quad word_native
+internal_member_dispatch:
+    .quad word_member_dispatch
+internal_local_get:
+    .quad word_local_get
+internal_local_set:
+    .quad word_local_set
+internal_exec:
+    .quad word_exec
+
 core_end:
+
+.section .bss
 
 # private state not exposed to core
 .align 8
@@ -667,6 +682,7 @@ dict_add:
     
 .dict_add_node:
     call node_add
+    mov [rip + dict_tail], rax
     mov r14, rax
     ret
 
@@ -1406,6 +1422,18 @@ word_tick:
     mov [r15], r13 # old TOS = NOS
     add r15, 8
     mov r13, rax # XT becomes new TOS
+    ret
+
+word_dict_tail_get:
+    mov [r15], r13
+    add r15, 8
+    mov r13, r14
+    ret
+
+word_dict_tail_set:
+    mov r14, r13
+    sub r15, 8
+    mov r13, [r15]
     ret
 
 word_lit:
@@ -2744,12 +2772,20 @@ _start:
     lea rax, [rsp + 8]
     mov [rip + argv], rax
 
-    # dict must be null (0) for first node_add call
-    xor r14d, r14d 
 
     # bind runtime stacks
     lea r15, [rip + data_stack]
     lea rbx, [rip + scope_stack]
+
+    lea rax, [rip + dict]
+    mov [rip + dict_base], rax
+
+    lea rax, [rip + dict_end]
+    mov [rip + dict_end_ptr], rax
+
+    # dict must be null (0) for first node_add call
+    xor r14d, r14d 
+    mov [rip + dict_tail], r14
 
     # load builtins into dict
 .load_builtins:

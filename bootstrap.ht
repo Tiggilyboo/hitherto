@@ -168,6 +168,22 @@
     [ :source-dirfd $4 lit immediate ]
     [ :source-data $5 lit immediate ]
     [ :source-len $6 lit immediate ]
+
+    [ :dict $7 @ lit immediate ]
+    [ :dict-end $8 @ lit immediate ]
+    [ :dict-tail@ $9 lit immediate ]
+    [ :dict-tail! $10 lit immediate ]
+
+    [ :lit $11 lit immediate ]
+    [ :branch $12 lit immediate ]
+    [ :ctrl-push $13 lit immediate ]
+    [ :ctrl-pop $14 lit immediate ]
+    [ :skip $15 lit immediate ]
+    [ :native $16 lit immediate ]
+    [ :member $17 lit immediate ]
+    [ :local@ $18 lit immediate ]
+    [ :local! $19 lit immediate ]
+    [ :exec $20 lit immediate ]
 ]
 
 # address is the value of a pointer
@@ -654,8 +670,7 @@
         len 1 + to len
     ]
     
-    1 # stdout for syscall before formatting
-    
+    1 # stdout
     v
     output~buf output~buf~len +
     digits
@@ -738,37 +753,115 @@
 # kernel/core node format for internal representation of memory for a word
 [ :node
     [ :code ( node:n -- :v )
-        @ to v
+        n @ to v
     ]
     [ :type ( node:n -- node:t )
-        8 +
+        n 8 +
         @
         -8 &
         to t
     ]
     [ :end ( node:n -- addr:v )
-        16 +
+        n 16 +
         @
         to v
     ]
-    [ :body ( -- :v )
-        24 +
+    [ :body ( node:n -- addr:v )
+        n 24 +
         to v
     ]
-    [ :name ( -- str:v )
-        body
+    [ :name ( node:n -- str:v )
+        n body
         to v
     ]
     [ :defs ( node:n -- node:tail )
-        ^
-        body @
+        n
+        ^ body @
         32 >>
         7 + -8 & # align
         body
         to tail
     ]
-    [ :prev ( -- node:v )
-        end @ to v
+    [ :prev ( node:n -- node:v )
+        n end @
+        to v
+    ]
+
+    [ :new ( str:name addr:code addr:at node:prev -- node:n addr:next )
+        [ :overflow 3 panic ]
+
+        at to n
+
+        n 40 +
+        name-len 15 +
+        -8 & +
+        to next
+
+        [
+            dict~end next < ? overflow
+        ]
+
+        code n !
+
+        # node type = 0
+        0 n 8 + !
+
+        # name descriptor: low 32 = 8 high32 = 8 + name-len
+        name-len 8 +
+        32 <<
+        8 |
+        n 24 +
+        !
+
+        # code is dead reuse local as destination cursor
+        n 32 +
+        to code
+
+        # copy name bytes
+        [
+            [
+                name-len 0 = ? ~]
+            ]
+            name u8~@
+            code u8~!
+
+            name 1 + to name
+            code 1 + to code
+            name-len 1 - to name-len
+            ~[
+        ]
+
+        # local dict tail = 0
+        0 next 16 - !
+
+        # node-end = payload / temp prev-cell addr
+        next 8 -
+        n 16 +
+        !
+
+        # temp prev-node
+        prev
+        next 8 - !
+    ]
+
+    [ :finalize ( node:n addr:end -- )
+        end n 16 + !
+        prev end !
+    ]
+]
+
+[ :dict
+    [ :base core~dict lit immediate ]
+    [ :end core~dict-end lit immediate ]
+    [ :tail
+        [ :@ core~dict~tail@ ]
+        [ :! core~dict~tail! ]
+    ]
+
+    [ :add ( node:n -- )
+        tail~@
+        n node~end !
+        n tail~!
     ]
 ]
 
