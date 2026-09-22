@@ -56,8 +56,6 @@ token_loop:
     .asciz "~["
 token_break:
     .asciz "~]"
-token_jump:
-    .asciz "~_"
 token_immediate:
     .asciz "immediate"
 token_asm:
@@ -504,10 +502,6 @@ read_token:
     je .skip_ws
     cmp al, byte ptr [rip + token_ign]
     je .skip_comment
-
-    cmp al, '"'
-    je .single
-
     jmp .next
 
 .skip_comment:
@@ -517,11 +511,6 @@ read_token:
     jne .skip_comment
     jmp .skip_ws
 
-.single:
-    mov byte ptr [rip + token_buf], al
-    mov r10, 1
-    jmp .done
-
 .next:
     cmp r10, TOKEN_MAX_LEN
     jge panic_token_overflow
@@ -529,6 +518,9 @@ read_token:
     lea rdx, [rip + token_buf]
     mov byte ptr [rdx + r10], al
     inc r10
+
+    cmp al, '"'
+    je .done
 
     call read_char
     jc .done
@@ -548,7 +540,6 @@ read_token:
     xor eax, eax
     clc
     ret
-
 .token_eof:
     stc
     ret
@@ -1521,14 +1512,6 @@ word_break:
     lea rcx, [rbp + NODE_BODY]
     lea r12, [rcx + rax]
     ret
-
-# TOS = node address
-word_jump:
-    mov rax, r13
-    sub r15, 8
-    mov r13, [r15]
-    mov rdx, [rax + NODE_CODE]
-    jmp rdx
 
 word_branch:
     cmp qword ptr [rip + state], STATE_DEF
@@ -2782,9 +2765,6 @@ _start:
     call dict_add_z
     lea rsi, [rip + token_break]
     lea rdi, [rip + word_break]
-    call dict_add_z
-    lea rsi, [rip + token_jump]
-    lea rdi, [rip + word_jump]
     call dict_add_z
     lea rsi, [rip + token_lit]
     lea rdi, [rip + word_compile_lit]

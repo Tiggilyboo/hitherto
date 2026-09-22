@@ -132,6 +132,16 @@
     ]
 ]
 
+# jump to the address in TOS
+[ :~_ ( :a -- )
+    [
+        0x4c 0x89 0xe8      # mov rax, r13
+        0x48 0x8b 0x10      # mov rdx, [rax]
+        0xff 0xe2           # jmp rdx
+        asm
+    ]
+]
+
 [ :sys ( :rax :rdi :rsi :rdx :r10 :r8 :r9 -- :r )
     rax rdi rsi rdx r10 r8 r9
     [
@@ -558,6 +568,7 @@
         [ :" 34 lit immediate ]
         [ :0 48 lit immediate ]
         [ :- 45 lit immediate ]
+        [ :/ 47 lit immediate ]
     ]
 
     [ :. ( b8:v -- )
@@ -580,29 +591,32 @@
 
 # str is a printable memory span (ie. the string type)
 [ memory:str
-    [ addr:ptr
-        ^ @
+    [ :ptr ( str:s -- addr:p )
+        s
+        s @
         u32~&
         +
+        to p
     ]
-    [ :len
-        @
+    [ :len ( str:s -- u32:l )
+        s @
         ^
         32 >>
         ><
         u32~&
         -
+        to l
     ]
-    [ :.
+    [ :. ( str:s -- )
         [ :err 13 panic ]
         1 # stdout
-        ><
+        s
         span
         linux~write
         0 < ? err
     ]
-    [ :.\n
-        .
+    [ :.\n ( str:s -- )
+        s .
         ascii~code~\n
         ascii~.
     ]
@@ -610,8 +624,8 @@
 
 [ :. ( :v -- )
     [ :err 13 panic ]
+
     [ :digits ( :n addr:p -- p :len )
-        [ :done ]
 
         0 to len
         [
@@ -629,7 +643,7 @@
 
             len 1 + to len
 
-            n 0 = ? done
+            [ n 0 = ? ~] ]
             ~[
         ]
     ]
@@ -903,7 +917,8 @@
 
     [ :find ( :dev :ino -- record:r )
         [ :done ]
-        registry @ to r
+        registry @
+        to r
 
         [
             r 0 = ? done
@@ -924,16 +939,13 @@
 
     [ :store ( :dev :ino record:r -- )
         registry @
-        r record~next
-        !
+        r record~next !
 
         dev
-        r record~dev
-        !
+        r record~dev !
 
         ino
-        r record~ino
-        !
+        r record~ino !
 
         r registry !
     ]
@@ -955,71 +967,137 @@
     [ :import
         [ :invalid 6 panic ]
         [ :overflow 3 panic ]
-        [ :file-flags 0x80000 lit immediate ] # O_CLOEXEC
 
-        [ :path
+        [ :file-flags 0x80000 lit immediate ] # O_CLOEXEC
+        [ :dir-flags 0x290000 lit immediate ] # O_PATH | O_DIRECTORY | O_CLOEXEC
+
+        [ :path ( -- str:q )
             str-parser~read
             ^ ascii~code~" =
             0 =
             ? invalid
             _
 
-            # consume everything until closing "
-            quoted-str
-
-            arena~cursor
-            ^ arena~end < 0 = ? overflow
-            _
-
-            # Reserve terminator
-            0
-            arena~cursor
-            u8~!
-
-            arena~cursor
-            1 +
-            arena~seek
+            quoted-cstr
+            to q
         ]
 
-        [ :consume ( :child-fd :saved-fd :saved-data :saved-len -- )
+        [ :open-child ( str:cq :base-dirfd -- :child-fd :child-dirfd )
+            [ :last-slash ( addr:scan-p u64:scan-n -- addr:slash-p )
+                0 to slash-p
+
+                [
+                    [
+                        scan-n 0 = ? ~]
+                    ]
+
+                    scan-n 1 -
+                    to scan-n
+
+                    scan-p scan-n +
+                    to slash-p
+
+                    [
+                        slash-p u8~@
+                        ascii~code~/ = ? ~]
+                    ]
+
+                    0 to slash-p
+                    ~[
+                ]
+            ]
+
+            [ :no-slash ( str:q :base addr:slash -- :fd :dirfd )
+                base
+                c"." str~ptr
+                dir-flags
+                0
+                linux~openat
+
+                ^ 0 < ? invalid
+                to dirfd
+
+                dirfd
+                q str~ptr
+                file-flags
+                0
+                linux~openat
+
+                ^ 0 < ? invalid
+                to fd
+            ]
+
+            [ :with-slash ( cstr:q :base addr:slash -- :fd :dirfd )
+                0 slash u8~!
+
+                base
+                q str~ptr
+                dir-flags
+                0
+                linux~openat
+
+                ^ 0 < ? invalid
+                to dirfd
+
+                dirfd
+                slash 1 +
+                file-flags
+                0
+                linux~openat
+
+                ^ 0 < ? invalid
+                to fd
+            ]
+
+            cq
+            base-dirfd
+
+            cq str~ptr
+            cq str~len
+            last-slash
+
+            [
+                ^ 0 = ? no-slash
+                with-slash
+            ]
+
+            to child-dirfd
+            to child-fd
+        ]
+
+        [ :consume ( addr:mark :child-fd :child-dirfd :saved-fd :saved-dirfd :saved-data :saved-len -- )
+            mark arena~seek
+
             child-fd core~source-fd !
+            child-dirfd core~source-dirfd !
             0 core~source-data !
             0 core~source-len !
             source
 
-            # restore parent
             saved-fd core~source-fd !
+            saved-dirfd core~source-dirfd !
             saved-data core~source-data !
             saved-len core~source-len !
 
-            child-fd linux~close
+            child-fd
+            linux~close
+            0 < ? invalid
+
+            child-dirfd
+            linux~close
             0 < ? invalid
         ]
 
         # import body continues
         arena~cursor
+
         path
-
-        # Resolve imports against current directory
         core~source-dirfd @
-        ><
+        open-child
         
-        str~ptr
-        file-flags
-        0
-        linux~openat
-
-        # stack: path fd
-        ^ 0 < ? invalid
-
-        # discard path, keep fd
-        ><
-        arena~seek
-
-        # TODO: Different directory that same file
-
         # stack: child-fd
         core~source-fd @
+        core~source-dirfd @
         core~source-data @
         core~source-len @
 
@@ -1029,9 +1107,5 @@
     ]
 ]
 
-[ module:test import "test.ht" ]
-
-test
-0x12345678 test~imported-word
-.
-ascii~.\n
+"Loading tests" str~.
+[ module:test import "tests/test.ht" ]
