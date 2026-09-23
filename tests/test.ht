@@ -1,2 +1,44 @@
-"Hello Import!" str~.\n
+[ :basic
+    # TODO: This is broken and does not emit the address for some reason
+    core~exec
+    # then this underflows. Yay.
+    .
+    core~exec @
+    .
+]
+
+[ :pass
+    "PASS" str~.\n
+]
+[ :fail
+    "FAIL" str~.\n
+    0 panic
+]
+
+[ :assert ( addr:actual addr:expected -- )
+    actual expected =
+    ? pass
+    fail
+]
+
+[ :construct-node ( -- node:n addr:next )
+    [ :test-fn
+        "Chicken" str~.\n
+    ]
+ 
+    "Test"
+    core~exec @
+    dict~here
+    node~new
+
+    to next
+    to n
+
+    n next node~finalize
+    n dict~add
+
+    "Test" dict~find
+    n
+    assert
+]
 

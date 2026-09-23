@@ -133,9 +133,11 @@
 ]
 
 # jump to the address in TOS
-[ :~_ ( :a -- )
+[ :~_
     [
         0x4c 0x89 0xe8      # mov rax, r13
+        0x49 0x83 0xef 0x08 # sub r15, 8
+        0x4d 0x8b 0x2f      # mov r13, [r15]
         0x48 0x8b 0x10      # mov rdx, [rax]
         0xff 0xe2           # jmp rdx
         asm
@@ -636,6 +638,57 @@
         ascii~code~\n
         ascii~.
     ]
+    [ := ( str:a str:b -- :equals )
+        [ :not-eq 0 to equals ]
+        [ :eq 1 to equals ]
+
+        [ :cmp-tail ( addr:i addr:j u64:n -- )
+            [
+                [
+                    n 0 = ? eq
+                ]
+                i u8~@
+                j u8~@
+                =
+                0 = ? not-eq
+
+                i 1 + to i
+                j 1 + to j
+                n 1 - to n
+                ~[
+            ]
+        ]
+
+        [ :cmp-values ( addr:i addr:j u64:n -- )
+            [
+                [
+                    n 8 < ? cmp-tail
+                ]
+
+                i b64~@
+                j b64~@
+                =
+                0 = ? not-eq
+
+                i 8 + to i
+                j 8 + to j
+                n 8 - to n
+                ~[
+            ]
+        ]
+        a len
+        b len =
+        0 = ? not-eq
+
+        a ptr
+        b ptr
+        = ? eq
+
+        a ptr
+        b ptr
+        a len
+        cmp-values
+    ]
 ]
 
 [ :. ( :v -- )
@@ -730,7 +783,6 @@
     immediate
 ]
 
-
 # cstr is null terminated str usually used for C ffi
 [ str:cstr ]
 
@@ -752,27 +804,88 @@
 
 # kernel/core node format for internal representation of memory for a word
 [ :node
-    [ :code ( node:n -- :v )
-        n @ to v
+    [ :code
+        [ :ref ( node:n -- addr:p )
+            n to p
+        ]
+
+        [ :@ ( node:n -- addr:v )
+            n ref b64~@
+            to v
+        ]
+
+        [ :! ( addr:v node:n -- )
+            v
+            n ref
+            b64~!
+        ]
     ]
-    [ :type ( node:n -- node:t )
-        n 8 +
-        @
-        -8 &
-        to t
+
+    [ :type
+        [ :ref ( node:n -- addr:p )
+            n 8 + to p
+        ]
+
+        [ :@ ( node:n -- node:t )
+            n ref
+            b64~@
+            -8 &
+            to t
+        ]
+
+        [ :! ( node:t node:n -- )
+            # preserve low flag bits
+            n ref b64~@
+            7 &
+            t -8 &
+            |
+            n ref
+            b64~!
+        ]
     ]
-    [ :end ( node:n -- addr:v )
-        n 16 +
-        @
-        to v
+
+    [ :end
+        [ :ref ( node:n -- addr:p )
+            n 16 + to p
+        ]
+
+        [ :@ ( node:n -- addr:v )
+            n ref
+            b64~@
+            to v
+        ]
+
+        [ :! ( addr:v node:n -- )
+            v
+            n ref
+            b64~!
+        ]
     ]
+
+    [ :prev
+        [ :ref ( node:n -- addr:p )
+            n end~@
+            to p
+        ]
+
+        [ :@ ( node:n -- node:v )
+            n ref b64~@
+            to v
+        ]
+
+        [ :! ( node:v node:n -- )
+            v
+            n ref
+            b64~!
+        ]
+    ]
+
     [ :body ( node:n -- addr:v )
-        n 24 +
-        to v
+        n 24 + to v
     ]
+
     [ :name ( node:n -- str:v )
-        n body
-        to v
+        n body to v
     ]
     [ :defs ( node:n -- node:tail )
         n
@@ -782,71 +895,77 @@
         body
         to tail
     ]
-    [ :prev ( node:n -- node:v )
-        n end @
-        to v
-    ]
 
-    [ :new ( str:name addr:code addr:at node:prev -- node:n addr:next )
+    [ :new ( str:s addr:fn addr:at -- node:n addr:next )
         [ :overflow 3 panic ]
 
         at to n
 
-        n 40 +
-        name-len 15 +
-        -8 & +
+        # next = body + aligned(name desc + bytes) + local tail + prev
+        n body
+        n str~len
+        15 +
+        -8 &
+        +
+        16 +
         to next
 
         [
-            dict~end next < ? overflow
+            core~dict-end next < ? overflow
         ]
 
-        code n !
+        fn n code~!
 
-        # node type = 0
-        0 n 8 + !
+        # type
+        0 n type~ref b64~!
 
-        # name descriptor: low 32 = 8 high32 = 8 + name-len
-        name-len 8 +
+        # name desc
+        s str~len
+        8 +
         32 <<
         8 |
-        n 24 +
-        !
-
-        # code is dead reuse local as destination cursor
-        n 32 +
-        to code
+        n body
+        b64~!
 
         # copy name bytes
+        s str~ptr to at
+        n name str~ptr to fn
+        s str~len to s
+
         [
             [
-                name-len 0 = ? ~]
+                s 0 = ? ~]
             ]
-            name u8~@
-            code u8~!
 
-            name 1 + to name
-            code 1 + to code
-            name-len 1 - to name-len
+            at u8~@
+            fn u8~!
+
+            at 1 + to at
+            fn 1 + to fn
+            s 1 - to s
+
             ~[
         ]
 
-        # local dict tail = 0
-        0 next 16 - !
+        0 n defs b64~!
 
-        # node-end = payload / temp prev-cell addr
-        next 8 -
-        n 16 +
-        !
+        n defs
+        8 +
+        n end~!
 
-        # temp prev-node
-        prev
-        next 8 - !
+        0 n prev~!
     ]
 
-    [ :finalize ( node:n addr:end -- )
-        end n 16 + !
-        prev end !
+    [ :finalize ( node:n addr:p -- )
+        p n end~!
+        0 n prev~!
+    ]
+
+    [ :match ( node:n str:s -- :found )
+        n name
+        s
+        str~=
+        to found
     ]
 ]
 
@@ -854,14 +973,44 @@
     [ :base core~dict lit immediate ]
     [ :end core~dict-end lit immediate ]
     [ :tail
-        [ :@ core~dict~tail@ ]
-        [ :! core~dict~tail! ]
+        [ :@ core~dict-tail@ ~_ ]
+        [ :! core~dict-tail! ~_ ]
+    ]
+
+    [ :here ( -- addr:p )
+        [ :first base to p ]
+
+        tail~@
+        [
+            ^ 0 = ? first
+            node~end~@
+            8 +
+            to p
+        ]
     ]
 
     [ :add ( node:n -- )
         tail~@
-        n node~end !
+        n node~prev !
         n tail~!
+    ]
+
+    [ :find ( str:s -- node:n )
+        [ :missing 2 panic ]
+
+        tail~@ to n
+
+        [
+            [
+                n 0 = ? missing
+            ]
+            n s node~match ? ~]
+
+            n node~prev~@
+            to n
+
+            ~[
+        ]
     ]
 ]
 
@@ -1201,4 +1350,8 @@
 ]
 
 "Loading tests" str~.
+
 [ module:test import "tests/test.ht" ]
+
+# test~construct-node
+test~basic

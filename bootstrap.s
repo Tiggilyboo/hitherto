@@ -682,7 +682,6 @@ dict_add:
     
 .dict_add_node:
     call node_add
-    mov [rip + dict_tail], rax
     mov r14, rax
     ret
 
@@ -2785,7 +2784,6 @@ _start:
 
     # dict must be null (0) for first node_add call
     xor r14d, r14d 
-    mov [rip + dict_tail], r14
 
     # load builtins into dict
 .load_builtins:
