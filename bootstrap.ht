@@ -176,7 +176,7 @@
     [ :dict-tail@ $9 lit immediate ]
     [ :dict-tail! $10 lit immediate ]
 
-    [ :lit $11 lit immediate ]
+    [ :lit-ptr $11 lit immediate ]
     [ :branch $12 lit immediate ]
     [ :ctrl-push $13 lit immediate ]
     [ :ctrl-pop $14 lit immediate ]
