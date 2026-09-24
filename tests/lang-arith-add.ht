@@ -1,0 +1,6 @@
+[ module:test import "../src/test.ht" ]
+
+test~bench
+20 22 +
+42
+test~assert

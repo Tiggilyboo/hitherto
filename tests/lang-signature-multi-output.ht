@@ -1,0 +1,14 @@
+[ module:test import "../src/test.ht" ]
+
+[ :pair ( :x -- x :y )
+    2 to y
+]
+
+test~bench
+7 pair
+2 =
+><
+7 =
+&
+1
+test~assert

@@ -1,0 +1,14 @@
+[ module:test import "../src/test.ht" ]
+
+[ :root
+    [ :branch
+        [ :value ( -- :v )
+            42 to v
+        ]
+    ]
+]
+
+test~bench
+root~branch~value
+42
+test~assert

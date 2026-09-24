@@ -1,0 +1,145 @@
+
+[ :stat
+    [ :len 144 lit immediate ]
+
+    [ :buf
+        [ :init
+            len arena~alloc
+            lit
+            immediate
+        ]
+        init
+    ]
+
+    [ :mode ( :fd -- u32:mode )
+        [ :invalid 13 panic ]
+
+        fd
+        buf
+        linux~fstat
+
+        ^ 0 < ? invalid
+        _
+
+        buf
+        24 +
+        u32~@
+        to mode
+    ]
+]
+
+[ :open-dir-at ( cstr:q :base-dirfd -- :fd )
+    base-dirfd
+    q
+    0x90000 # O_RDONLY | O_DIRECTORY | O_CLOEXEC
+    0
+    linux~openat
+    to fd
+]
+
+[ :join ( cstr:dir cstr:name -- cstr:result )
+    [ :append ( cstr:s addr:p -- addr:q )
+        [
+            [
+                s u8~@
+                0 = ? ~]
+            ]
+
+            s u8~@
+            p u8~!
+
+            s 1 + to s
+            p 1 + to p
+
+            ~[
+        ]
+
+        p to q
+    ]
+
+    # Worst case:
+    # dir + "/" + name + NUL
+    dir cstr~len
+    name cstr~len
+    +
+    2 +
+    arena~alloc
+    to result
+
+    # Copy directory.
+    dir
+    result
+    append
+
+    # Write a separator at the current end while preserving the cursor.
+    ^ ascii~code~/ >< u8~!
+
+    # Advance over it only when dir does not already end in "/".
+    dir
+    dir cstr~len
+    1 -
+    +
+    u8~@
+    ascii~code~/
+    =
+    0 =
+    +
+
+    # Copy filename.
+    name
+    ><
+    append
+
+    # NUL terminate.
+    ^ 0 >< u8~!
+    _
+]
+
+[ :dirent64
+    [ :ino ( addr:e -- u64:v )
+        e
+        u64~@
+        to v
+    ]
+
+    [ :off ( addr:e -- i64:v )
+        e 8 +
+        i64~@
+        to v
+    ]
+
+    [ :reclen ( addr:e -- u16:v )
+        e 16 +
+        u16~@
+        to v
+    ]
+
+    [ :type ( addr:e -- u8:v )
+        e 18 +
+        u8~@
+        to v
+    ]
+
+    [ :name ( addr:e -- cstr:v )
+        e 19 +
+        to v
+    ]
+
+    [ :next ( addr:e -- addr:v )
+        e
+        e reclen
+        +
+        to v
+    ]
+]
+
+[ :dirent-type
+    [ :unknown 0 lit immediate ]
+    [ :fifo 1 lit immediate ]
+    [ :char 2 lit immediate ]
+    [ :dir 4 lit immediate ]
+    [ :block 6 lit immediate ]
+    [ :regular 8 lit immediate ]
+    [ :link 10 lit immediate ]
+    [ :socket 12 lit immediate ]
+]

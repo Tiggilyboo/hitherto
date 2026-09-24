@@ -1,0 +1,16 @@
+[ module:test import "../src/test.ht" ]
+
+[ :shadow-base
+    [ :x ( -- :v )
+        99 to v
+    ]
+
+    [ :take ( :x -- :v )
+        x to v
+    ]
+]
+
+test~bench
+7 shadow-base~take
+7
+test~assert

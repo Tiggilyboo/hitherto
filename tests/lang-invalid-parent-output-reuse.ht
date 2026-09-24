@@ -1,0 +1,22 @@
+[ module:test import "../src/test.ht" ]
+
+[ :expect-invalid ( frame:f -- )
+    [ :ok
+        "PASS" str~.\n
+        0 linux~exit
+    ]
+
+    f frame~code
+    6 =
+    ? ok
+
+    -1 linux~exit
+]
+
+' expect-invalid core~panic-handler !
+
+[ :invalid-parent-output ( :x -- )
+    [ :child ( -- x ) ]
+]
+
+-1 linux~exit

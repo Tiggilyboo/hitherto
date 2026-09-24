@@ -122,6 +122,10 @@ internal_local_set:
     .quad word_local_set
 internal_exec:
     .quad word_exec
+scope_stack_ptr:
+    .quad scope_stack
+data_stack_ptr:
+    .quad data_stack
 
 core_end:
 

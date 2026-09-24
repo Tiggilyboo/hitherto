@@ -1,0 +1,10 @@
+[ module:test import "../src/test.ht" ]
+
+[ :sum ( :a :b -- :r )
+    a b + to r
+]
+
+test~bench
+20 22 sum
+42
+test~assert

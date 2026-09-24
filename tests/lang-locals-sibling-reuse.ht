@@ -1,0 +1,21 @@
+[ module:test import "../src/test.ht" ]
+
+[ :siblings ( :seed -- :r )
+    [ :first ( :x -- :v )
+        x 1 + to v
+    ]
+
+    [ :second ( :x -- :v )
+        x 2 + to v
+    ]
+
+    seed first
+    seed second
+    +
+    to r
+]
+
+test~bench
+10 siblings
+23
+test~assert

@@ -1,0 +1,30 @@
+[ module:test import "../src/test.ht" ]
+
+[ :base
+    [ :value ( -- :v )
+        1 to v
+    ]
+
+    [ :twice ( -- :v )
+        value value + to v
+    ]
+]
+
+[ base:left
+    [ :value ( -- :v )
+        10 to v
+    ]
+]
+
+[ base:right
+    [ :value ( -- :v )
+        11 to v
+    ]
+]
+
+test~bench
+left~twice
+right~twice
++
+42
+test~assert

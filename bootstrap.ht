@@ -186,10 +186,10 @@
     [ :local@ $18 lit immediate ]
     [ :local! $19 lit immediate ]
     [ :exec $20 lit immediate ]
-]
 
-# address is the value of a pointer
-[ :addr ]
+    [ :scope-stack $21 lit immediate ]
+    [ :data-stack $22 lit immediate ]
+]
 
 # qword allocation in the data stack
 [ :cell
@@ -199,6 +199,12 @@
         mask
         &
         to o
+    ]
+    [ := ( :a :b -- :c )
+        a &
+        b &
+        =
+        to c
     ]
 ]
 
@@ -310,7 +316,17 @@
 [ b8:u8 ]
 [ b16:u16 ]
 [ b32:u32 ]
-[ b64:u64 ]
+
+[ b64:u64
+    [ :align ( u64:v u64:a -- v )
+        v
+        a 1 - +
+        0 a -
+        &
+        to v
+    ]
+    
+]
 
 [ b8:i8
     # mask 8 bits, then sign extend
@@ -366,6 +382,18 @@
     ]
 ]
 [ b64:i64 ]
+
+# address is the value of a pointer
+[ :addr
+    # align the address to byte size
+    [ :align ( addr:p u64:a -- addr:q )
+        p
+        a 1 - +
+        0 a -
+        &
+        to q
+    ]
+]
 
 # Defines an arbitrary segment of memory
 [ :memory
@@ -638,15 +666,14 @@
         ascii~code~\n
         ascii~.
     ]
-    [ := ( str:a str:b -- :equals )
-        [ :not-eq 0 to equals ]
-        [ :eq 1 to equals ]
+    [ :eq ( str:a str:b -- :is-eq )
+        [ :not-eq 0 to is-eq ]
+        [ :eq 1 to is-eq ]
 
         [ :cmp-tail ( addr:i addr:j u64:n -- )
             [
-                [
-                    n 0 = ? eq
-                ]
+                n 0 = ? eq
+
                 i u8~@
                 j u8~@
                 =
@@ -660,10 +687,12 @@
         ]
 
         [ :cmp-values ( addr:i addr:j u64:n -- )
+            [ :tail
+                i j n
+                cmp-tail
+            ]
             [
-                [
-                    n 8 < ? cmp-tail
-                ]
+                n 8 < ? tail
 
                 i b64~@
                 j b64~@
@@ -784,9 +813,24 @@
 ]
 
 # cstr is null terminated str usually used for C ffi
-[ str:cstr ]
+[ str:cstr
+    [ :ptr ( cstr:s -- addr:p )
+        s to p
+    ]
+    [ :len ( cstr:s -- u64:n )
+        0 to n
+        [
+            s n +
+            u8~@
+            0 = ? ~]
 
-[ :quoted-cstr
+            n 1 + to n
+            ~[
+        ]
+    ]
+]
+
+[ :quoted-cstr ( -- cstr:s )
     quoted-str
 
     # null terminated
@@ -794,6 +838,10 @@
     arena~cursor
     1 +
     arena~seek
+
+    # cstr is the actual pointer not a str descriptor
+    str~ptr
+    to s
 ]
 
 [ :c"
@@ -887,13 +935,50 @@
     [ :name ( node:n -- str:v )
         n body to v
     ]
-    [ :defs ( node:n -- node:tail )
-        n
-        ^ body @
+    [ :defs ( node:n -- addr:p )
+        n body
+        n body @
         32 >>
-        7 + -8 & # align
-        body
-        to tail
+        +
+        8 addr~align
+        to p
+    ]
+
+    [ :local
+        [ :binding ( node:n -- :v )
+            n defs
+            8 +
+            @
+            to v
+        ]
+        [ :count ( node:n -- u64:count )
+            n binding
+            8 >>
+            0xf &
+            to count
+        ]
+        [ :slot ( node:n -- u8:i )
+            n binding
+            7 &
+            to i
+        ]
+        [ :at ( node:n u8:i -- node:l )
+            n defs
+            16 +
+            to l
+
+            [
+                i 0 = ? ~]
+
+                l end~@
+                8 +
+                to l
+
+                i 1 - to i
+
+                ~[
+            ]
+        ]
     ]
 
     [ :new ( str:s addr:fn addr:at -- node:n addr:next )
@@ -903,10 +988,11 @@
 
         # next = body + aligned(name desc + bytes) + local tail + prev
         n body
-        n str~len
-        15 +
-        -8 &
+            n str~len
+            8 +
         +
+        8
+        addr~align
         16 +
         to next
 
@@ -915,8 +1001,6 @@
         ]
 
         fn n code~!
-
-        # type
         0 n type~ref b64~!
 
         # name desc
@@ -933,9 +1017,7 @@
         s str~len to s
 
         [
-            [
-                s 0 = ? ~]
-            ]
+            [ s 0 = ? ~] ]
 
             at u8~@
             fn u8~!
@@ -964,7 +1046,7 @@
     [ :match ( node:n str:s -- :found )
         n name
         s
-        str~=
+        str~eq
         to found
     ]
 ]
@@ -995,21 +1077,98 @@
         n tail~!
     ]
 
-    [ :find ( str:s -- node:n )
-        [ :missing 2 panic ]
-
-        tail~@ to n
+    [ :find ( node:n str:s -- node:v )
+        n node~defs
+        @
+        to v
 
         [
-            [
-                n 0 = ? missing
-            ]
-            n s node~match ? ~]
+            v 0 = ? ~]
 
-            n node~prev~@
-            to n
+            [
+                v s node~match ? ~]
+            ]
+
+            v node~prev~@
+            to v
 
             ~[
+        ]
+    ]
+]
+
+[ :scope-tag
+    [ :& ( :v -- scope-tag:t )
+        v 7 &
+        to t
+    ]
+    [ :parent ( -- scope-tag:v )
+        1 to v immediate
+    ]
+    [ :context ( -- scope-tag:v )
+        2 to v immediate
+    ]
+    [ :compile ( -- scope-tag:v )
+        4 to v immediate
+    ]
+]
+
+[ :scope-index
+    [ :& ( :v -- scope-index:i )
+        v 0x3fff &
+        to i
+    ]
+]
+
+# format for scope elements in the scope stack
+[ :scope
+    [ :tag ( scope:s -- scope-tag:t )
+        s scope-tag~&
+        to t
+    ]
+    [ :node ( scope:s -- node:n )
+        s -8 &
+        to n
+    ]
+    [ :invocation
+        [ :owner ( scope:s -- node:n )
+            s
+                core~dict-end
+                core~dict
+                -
+            8 - &
+            core~dict
+            +
+            to n
+        ]
+        [ :local-base ( scope:s -- addr:p )
+            s 17 >>
+            scope-index~&
+            8 *
+            core~data-stack @
+            +
+            to p
+        ]
+        [ :valid ( scope:s -- u8:v )
+            s 31 >>
+            u8~&
+            to v
+        ]
+        [ :body-floor ( scope:s -- addr:p )
+            s 39 >>
+            scope-index~&
+            8 *
+            core~data-stack @
+            +
+            to p
+        ]
+
+        [ :stack-depth ( scope:s addr:cursor -- u64:n )
+            cursor
+            s body-floor
+            -
+            3 >>
+            to n
         ]
     ]
 ]
@@ -1025,46 +1184,60 @@
         @
         to v
     ]
+    [ :state-desc ( frame:f -- str:v )
+        [ :exe "EXEC" ]
+        [ :def "COMPILE" ]
+        [ :unk "UNKNOWN" ]
 
-    [ :definition ( frame:f -- node:v )
-        f 16 +
-        @
+        f state
+        [
+            ^ 0 = ? exe
+            ^ 1 = ? def
+            ? unk
+        ]
         to v
     ]
 
-    [ :scope ( frame:f -- :v )
-        f 24 +
-        @
+    [ :definition ( frame:f -- node:v )
+        f 16 + @
+        to v
+    ]
+
+    [ :scope-stack ( frame:f -- :v )
+        f 24 + @
         to v
     ]
 
     [ :instruction ( frame:f -- :v )
-        f 32 +
-        @
+        f 32 + @
         to v
     ]
 
     [ :tos ( frame:f -- :v )
-        f 40 +
-        @
+        f 40 + @
         to v
     ]
 
     [ :dictionary ( frame:f -- node:v )
-        f 48 +
-        @
+        f 48 + @
         to v
     ]
 
     [ :data-stack ( frame:f -- :v )
-        f 56 +
-        @
+        f 56 + @
         to v
     ]
 
     [ :native-stack ( frame:f -- :v )
-        f 64 +
-        @
+        f 64 + @
+        to v
+    ]
+
+    # cursor position of instruction node body
+    [ :instruction-offset ( frame:f -- :v )
+        f instruction
+        f definition node~body
+        -
         to v
     ]
 
@@ -1101,119 +1274,306 @@
         ]
         to v
     ]
+
+    [ :body-floor ( frame:f -- addr:p )
+        [ :root
+            _
+            core~data-stack @
+            to p
+        ]
+
+        [ :found
+            >< _
+            39 >>
+            scope-index~&
+            8 *
+            core~data-stack @
+            +
+            to p
+        ]
+
+        f scope-stack
+        [
+            ^ core~scope-stack @ = ? root
+
+            8 -
+            ^ @
+
+            ^ 0 <
+            ? found
+
+            _
+            ~[
+        ]
+    ]
+
+    [ :stack-depth ( frame:f -- u64:n )
+        f data-stack
+        f body-floor
+        -
+        3 >>
+        to n
+    ]
+
+    [ :data-depth ( frame:f -- u64:n )
+        f data-stack
+        core~data-stack @
+        -
+        3 >>
+        to n
+    ]
+
+    [ :call-stack ( frame:f -- )
+        [ :locals ( scope:s -- )
+            [ :walk ( u64:i u64:n -- )
+                [ :show
+                    "      " str~.
+
+                    s scope~invocation~owner
+                    i
+                    node~local~at
+
+                    ^ node~type~@
+                    [
+                        ^ 0 = ? _
+
+                        node~name
+                        str~.
+                        " " str~.
+                    ]
+
+                    node~name
+                    str~.
+
+                    ": " str~.
+
+                    s scope~invocation~local-base
+                    i 8 * +
+                    @
+                    .
+
+                    ascii~.\n
+                ]
+
+                [
+                    i n = ? ~]
+
+                    [
+                        s scope~invocation~valid
+                        1 i << &
+                        0 =
+                        0 =
+                        ? show
+                    ]
+
+                    i 1 + to i
+
+                    ~[
+                ]
+            ]
+
+            0
+
+            s scope~invocation~owner
+            node~local~count
+
+            walk
+            ascii~.\n
+        ]
+
+        [ :walk ( addr:p u64:i -- )
+            [ :invocation ( scope:s -- )
+                " #" str~.
+                i .
+                " " str~.
+
+                s scope~invocation~owner
+                node~name
+                str~.
+
+                " stack: " str~.
+                s
+                f data-stack
+                scope~invocation~stack-depth
+                .
+
+                ascii~.\n
+
+                s locals
+
+                i 1 + to i
+            ]
+
+            [
+                p core~scope-stack @ = ? ~]
+
+                p 8 - to p
+
+                [
+                    p @
+                    ^ 0 < ? invocation
+                    _
+                ]
+
+                ~[
+            ]
+        ]
+
+        f scope-stack
+        0
+        walk
+    ]
 ]
 
 [ :debugger ( frame:f -- )
+    [ :is-none "None" str~.\n ]
+
+    [ :print-node ( node:n -- )
+        n 0 = ? is-none
+
+        n node~name str~.
+
+        " (" str~.
+        n .
+        ")" str~.\n
+    ]
+
     "Panic: " str~.
     f frame~code-desc str~.
-    ascii~.\n
+    " (" str~.
+    f frame~code .
+    ")" str~.\n
 
     "State: " str~.
+    f frame~state-desc str~.
+    "(" str~.
     f frame~state .
-    ascii~.\n
+    ")" str~.\n
 
     "Definition: " str~.
-    f frame~definition .
-    ascii~.\n
+    f frame~definition
+    print-node
 
-    "Instruction: " str~.
-    f frame~instruction .
+    "IP Offset: " str~.
+    f frame~instruction-offset .
     ascii~.\n
 
     "TOS: " str~.
     f frame~tos .
     ascii~.\n
+
+    "Data: " str~.
+    f frame~data-stack .
+    " depth: " str~.
+    f frame~stack-depth .
+    ascii~.\n
+
+    "Call stack:" str~.\n
+    f frame~call-stack
 ]
 
 ' debugger core~panic-handler !
-
 "Loaded debugger" str~.\n
 
-[ :module
-    [ memory:record
-        [ :len 24 lit immediate ]
-
-        [ :next ( record:r -- addr:p )
-            r to p
-        ]
-        [ :dev ( record:r -- addr:p )
-            r 8 +
-            to p
-        ]
-        [ :ino ( record:r -- addr:p )
-            r 16 +
-            to p
-        ]
-    ]
-    
-    # to track all module imports
-    [ :registry
-        [ :init
-            8 arena~alloc
-            ^ 0 >< ! # preserve head = 0
-            lit
-            immediate
-        ]
-        init
-    ]
-
-    [ :find ( :dev :ino -- record:r )
-        [ :done ]
-        registry @
-        to r
-
-        [
-            r 0 = ? done
-            r record~dev @
-            dev =
-
-            r record~ino @
-            ino =
-
-            & ? done
-
-            r record~next @
-            to r
-
-            ~[
-        ]
-    ]
-
-    [ :store ( :dev :ino record:r -- )
-        registry @
-        r record~next !
-
-        dev
-        r record~dev !
-
-        ino
-        r record~ino !
-
-        r registry !
-    ]
-
-    [ :claim ( :dev :ino -- )
-        [ :err-dup 14 panic ]
-
-        dev ino find
-        0 =
-        0 =
-        ? err-dup
-
-        dev ino
-        record~len arena~alloc
-        store
-    ]
-
-    # parse path string following import
-    [ :import
+[ :path
+    [ :open ( cstr:q :base-dirfd -- :result-fd :result-dirfd )
         [ :invalid 6 panic ]
-        [ :overflow 3 panic ]
 
-        [ :file-flags 0x80000 lit immediate ] # O_CLOEXEC
+        [ :file-flags 0x80000 lit immediate ] # O_RDONLY | O_CLOEXEC
         [ :dir-flags 0x290000 lit immediate ] # O_PATH | O_DIRECTORY | O_CLOEXEC
 
-        [ :path ( -- str:q )
+        [ :last-slash ( addr:scan-p u64:scan-n -- addr:slash-p )
+            0 to slash-p
+
+            [
+                [
+                    scan-n 0 = ? ~]
+                ]
+
+                scan-n 1 - to scan-n
+                scan-p scan-n + to slash-p
+
+                [
+                    slash-p u8~@
+                    ascii~code~/ = ? ~]
+                ]
+
+                0 to slash-p
+                ~[
+            ]
+        ]
+
+        [ :no-slash ( cstr:name :base addr:slash -- :fd :dirfd )
+            # Produce an owned directory fd because module~import
+            # always closes result-dirfd after consuming the source.
+            base
+            c"."
+            dir-flags
+            0
+            linux~openat
+
+            ^ 0 < ? invalid
+            to dirfd
+
+            dirfd
+            name
+            file-flags
+            0
+            linux~openat
+
+            ^ 0 < ? invalid
+            to fd
+        ]
+
+        [ :with-slash ( cstr:name :base addr:slash -- :fd :dirfd )
+            # Temporarily terminate the directory component.
+            0 slash u8~!
+
+            base
+            name
+            dir-flags
+            0
+            linux~openat
+
+            # Restore before doing anything else with name.
+            ascii~code~/
+            slash u8~!
+
+            ^ 0 < ? invalid
+            to dirfd
+
+            dirfd
+            slash 1 +
+            file-flags
+            0
+            linux~openat
+
+            ^ 0 < ? invalid
+            to fd
+        ]
+
+        q
+        base-dirfd
+
+        q
+        q cstr~len
+        last-slash
+
+        [
+            ^ 0 = ? no-slash
+            with-slash
+        ]
+
+        to result-dirfd
+        to result-fd
+    ]
+]
+
+[ :module
+    [ :import
+        [ :invalid 6 panic ]
+
+        [ :read-path ( -- cstr:q )
             str-parser~read
             ^ ascii~code~" =
             0 =
@@ -1224,96 +1584,24 @@
             to q
         ]
 
-        [ :open-child ( str:cq :base-dirfd -- :child-fd :child-dirfd )
-            [ :last-slash ( addr:scan-p u64:scan-n -- addr:slash-p )
-                0 to slash-p
-
-                [
-                    [
-                        scan-n 0 = ? ~]
-                    ]
-
-                    scan-n 1 -
-                    to scan-n
-
-                    scan-p scan-n +
-                    to slash-p
-
-                    [
-                        slash-p u8~@
-                        ascii~code~/ = ? ~]
-                    ]
-
-                    0 to slash-p
-                    ~[
-                ]
-            ]
-
-            [ :no-slash ( str:q :base addr:slash -- :fd :dirfd )
-                base
-                c"." str~ptr
-                dir-flags
-                0
-                linux~openat
-
-                ^ 0 < ? invalid
-                to dirfd
-
-                dirfd
-                q str~ptr
-                file-flags
-                0
-                linux~openat
-
-                ^ 0 < ? invalid
-                to fd
-            ]
-
-            [ :with-slash ( cstr:q :base addr:slash -- :fd :dirfd )
-                0 slash u8~!
-
-                base
-                q str~ptr
-                dir-flags
-                0
-                linux~openat
-
-                ^ 0 < ? invalid
-                to dirfd
-
-                dirfd
-                slash 1 +
-                file-flags
-                0
-                linux~openat
-
-                ^ 0 < ? invalid
-                to fd
-            ]
-
-            cq
-            base-dirfd
-
-            cq str~ptr
-            cq str~len
-            last-slash
-
-            [
-                ^ 0 = ? no-slash
-                with-slash
-            ]
-
-            to child-dirfd
-            to child-fd
-        ]
-
-        [ :consume ( addr:mark :child-fd :child-dirfd :saved-fd :saved-dirfd :saved-data :saved-len -- )
+        [ :consume (
+            addr:mark
+            :child-fd
+            :child-dirfd
+            :saved-fd
+            :saved-dirfd
+            :saved-data
+            :saved-len
+            --
+        )
+            # Reclaim temporary quoted path before compiling child source.
             mark arena~seek
 
             child-fd core~source-fd !
             child-dirfd core~source-dirfd !
             0 core~source-data !
             0 core~source-len !
+
             source
 
             saved-fd core~source-fd !
@@ -1330,28 +1618,27 @@
             0 < ? invalid
         ]
 
-        # import body continues
+        # Preserve arena position before read-path allocates its cstr.
         arena~cursor
 
-        path
+        read-path
         core~source-dirfd @
-        open-child
-        
-        # stack: child-fd
+        path~open
+
+        # Preserve parent source state.
         core~source-fd @
         core~source-dirfd @
         core~source-data @
         core~source-len @
 
         consume
-        
+
         immediate
     ]
 ]
 
-"Loading tests" str~.
+"Booted" str~.\n
 
-[ module:test import "tests/test.ht" ]
+[ module:cli import "src/cli.ht" ]
 
-# test~construct-node
-test~basic
+cli~start

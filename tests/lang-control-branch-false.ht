@@ -1,0 +1,15 @@
+[ module:test import "../src/test.ht" ]
+
+[ :choose ( :flag -- :r )
+    [ :yes
+        42 to r
+    ]
+
+    flag ? yes
+    7 to r
+]
+
+test~bench
+0 choose
+7
+test~assert

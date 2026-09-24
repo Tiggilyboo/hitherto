@@ -1,0 +1,14 @@
+[ module:test import "../src/test.ht" ]
+
+[ :outer ( -- :r )
+    [ :child ( -- :v )
+        7 to v
+    ]
+
+    35 child + to r
+]
+
+test~bench
+outer
+42
+test~assert

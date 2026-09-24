@@ -1,0 +1,19 @@
+[ module:test import "../src/test.ht" ]
+
+[ :break-at-five ( -- :r )
+    0 to r
+
+    [
+        [
+            r 5 = ? ~]
+        ]
+
+        r 1 + to r
+        ~[
+    ]
+]
+
+test~bench
+break-at-five
+5
+test~assert

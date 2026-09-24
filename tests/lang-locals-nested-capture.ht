@@ -1,0 +1,14 @@
+[ module:test import "../src/test.ht" ]
+
+[ :outer-capture ( :x -- :r )
+    [ :inner ( :y -- :v )
+        x y + to v
+    ]
+
+    10 inner to r
+]
+
+test~bench
+32 outer-capture
+42
+test~assert

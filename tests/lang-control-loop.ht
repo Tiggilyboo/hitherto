@@ -1,0 +1,21 @@
+[ module:test import "../src/test.ht" ]
+
+[ :count-down ( :n -- :r )
+    0 to r
+
+    [
+        [
+            n 0 = ? ~]
+        ]
+
+        r 1 + to r
+        n 1 - to n
+
+        ~[
+    ]
+]
+
+test~bench
+5 count-down
+5
+test~assert

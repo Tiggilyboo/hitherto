@@ -1,0 +1,14 @@
+[ module:test import "../src/test.ht" ]
+
+[ :base
+    [ :value ( -- :v )
+        42 to v
+    ]
+]
+
+[ base:derived ]
+
+test~bench
+derived~value
+42
+test~assert

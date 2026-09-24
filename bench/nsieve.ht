@@ -1,0 +1,105 @@
+[ module:test import "../src/test.ht" ]
+
+[ :done ]
+
+[ :nsieve ( :m -- )
+
+    [ :run ( :base -- )
+
+        [ :init ( :i -- )
+            [
+                i m < 0 = ? done
+
+                1
+                base i +
+                u8~!
+
+                i 1 + to i
+
+                ~[
+            ]
+        ]
+
+        [ :sieve ( :i :count -- count )
+
+            [ :mark ( :j -- )
+                [
+                    j m < 0 = ? done
+
+                    0
+                    base j +
+                    u8~!
+
+                    j i + to j
+
+                    ~[
+                ]
+            ]
+
+            [
+                i m < 0 = ? done
+
+                [
+                    base i +
+                    u8~@
+                    0 = ? done
+
+                    count 1 + to count
+
+                    i 1 <<
+                    mark
+                ]
+
+                i 1 + to i
+
+                ~[
+            ]
+        ]
+
+        0 init
+
+        2 0 sieve
+
+        m .
+        " " str~.
+        .
+        ascii~.\n
+
+        # munmap(base, m)
+        11
+        base
+        m
+        0
+        0
+        0
+        0
+        sys
+        _
+    ]
+
+    # mmap(NULL, m,
+    #      PROT_READ | PROT_WRITE,
+    #      MAP_PRIVATE | MAP_ANONYMOUS,
+    #      -1, 0)
+    9
+    0
+    m
+    3
+    34
+    -1
+    0
+    sys
+
+    # mmap result is already TOS
+    run
+]
+
+[ :bench
+    10000 12 << nsieve
+    10000 11 << nsieve
+    10000 10 << nsieve
+]
+
+test~bench
+bench
+test~pass

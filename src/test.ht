@@ -1,0 +1,79 @@
+
+[ linux:linux
+    [ :clock-gettime ( :clock-id addr:tp -- :result )
+        228
+        clock-id
+        tp
+        0 0 0 0
+        sys
+        to result
+    ]
+]
+
+[ :clock
+    [ :buf
+        [ :init
+            16 arena~alloc
+            lit
+            immediate
+        ]
+        init
+    ]
+
+    [ :now ( -- u64:v )
+        [ :error 13 panic ]
+
+        1 # CLOCK_MONOTONIC
+        buf
+        linux~clock-gettime
+        [
+            ^ 0 < ? error
+        ]
+        _
+
+        # timespec:
+        # +0 sec
+        # +8 nsec
+        buf u64~@
+        1000000000 *
+        buf 8 + u64~@
+        +
+        to v
+    ]
+]
+
+[ :timestamp
+    [ :init
+        8 arena~alloc
+        lit
+        immediate
+    ]
+    init
+]
+
+[ :pass
+    clock~now
+    timestamp u64~@
+    -
+    .
+    " ns" str~.\n
+
+    "PASS" str~.\n
+    0 linux~exit
+]
+
+[ :fail ( str:reason -- )
+    "FAIL" str~.\n
+    -1 linux~exit
+]
+
+[ :assert ( addr:actual addr:expected -- )
+    actual expected =
+    ? pass
+    fail
+]
+
+[ :bench
+    clock~now
+    timestamp u64~!
+]

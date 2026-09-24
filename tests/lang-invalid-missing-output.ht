@@ -1,0 +1,20 @@
+[ module:test import "../src/test.ht" ]
+
+[ :expect-not-found ( frame:f -- )
+    [ :ok
+        "PASS" str~.\n
+        0 linux~exit
+    ]
+
+    f frame~code
+    2 =
+    ? ok
+
+    -1 linux~exit
+]
+
+' expect-not-found core~panic-handler !
+
+[ :invalid-missing-output ( -- missing ) ]
+
+-1 linux~exit

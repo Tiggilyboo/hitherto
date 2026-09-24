@@ -1,0 +1,21 @@
+[ module:test import "../src/test.ht" ]
+
+[ :branch-region ( :flag -- :r )
+    [ :hit
+        41 to r
+    ]
+
+    0 to r
+
+    [
+        flag ? hit
+        99 to r
+    ]
+
+    r 1 + to r
+]
+
+test~bench
+1 branch-region
+42
+test~assert

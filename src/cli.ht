@@ -1,0 +1,314 @@
+[ path:path import "path.ht" ]
+
+# extend the syscall class from minimal ones defined in bootstrap.ht
+[ linux:linux
+    [ :fork ( -- :pid )
+        57 0 0 0 0 0 0
+        sys
+        to pid
+    ]
+
+    [ :execve ( cstr:file addr:argv addr:envp -- :result )
+        59
+        file argv envp 0 0 0
+        sys
+        to result
+    ]
+
+    [ :wait4 ( :pid addr:status u32:options addr:rusage -- :result )
+        61
+        pid status options rusage
+        0 0
+        sys
+        to result
+    ]
+
+    [ :fchdir ( :fd -- :result )
+        81 fd 0 0 0 0 0
+        sys
+        to result
+    ]
+
+    [ :getdents64 ( u32:fd addr:buf u64:count -- :result )
+        217
+        fd buf count
+        0 0 0
+        sys
+        to result
+    ]
+]
+
+[ :argc ( -- u64:n )
+    core~argc @
+    to n
+]
+
+[ :arg ( u64:i -- addr:p )
+    core~argv @
+    i 8 * +
+    @
+    to p
+]
+
+[ :run-file ( cstr:fp -- u32:status )
+    [ :error 13 panic ]
+
+    [ :test-exec-argv
+        [ :init
+            32 arena~alloc
+            lit
+            immediate
+        ]
+        init
+    ]
+
+    [ :wait-status
+        [ :init 
+            8 arena~alloc
+            lit
+            immediate
+        ]
+        init
+    ]
+
+    [ :child ( :pid -- )
+        pid 0 = 0 = ? error
+
+        c"/proc/self/exe" test-exec-argv !
+        c"test-proc" test-exec-argv 8 + !
+        fp test-exec-argv 16 + !
+        0 test-exec-argv 24 + !
+
+        c"/proc/self/exe"
+        test-exec-argv
+        0
+        linux~execve
+
+        # execve only returns on failure
+        error
+    ]
+
+    [ :parent ( :pid -- u32:pstatus )
+        0 wait-status u32~!
+
+        pid
+        wait-status
+        0 # options
+        0 # rusage
+        linux~wait4
+
+        [
+            ^ 0 < ? error
+        ]
+
+        _ # returned pid
+
+        wait-status u32~@
+        to pstatus
+    ]
+
+    linux~fork
+
+    [
+        ^ 0 < ? error
+        ^ 0 = ? child
+    ]
+
+    parent
+    to status
+]
+
+[ :run-dir ( cstr:dp :scan-fd -- u32:status )
+    [ :error 13 panic ]
+
+    [ :dir-buffer
+        [ :len 4096 lit immediate ]
+        [ :init
+            len
+            arena~alloc
+            lit
+            immediate
+        ]
+        init
+    ]
+
+    [ :entry ( addr:e cstr:dir u32:failed -- u32:result )
+        failed to result
+
+        [
+            [
+                e path~dirent64~type
+                path~dirent-type~regular
+                =
+                0 = ? ~]
+            ]
+
+            dir
+            e path~dirent64~name
+            path~join
+            run-file
+
+            0 =
+            0 =
+            failed +
+            to result
+        ]
+    ]
+
+    [ :walk ( u64:n cstr:dir addr:p u32:failed -- u32:result )
+        [
+            [
+                n 0 = ? ~]
+            ]
+
+            p
+            dir
+            failed
+            entry
+            to failed
+
+            n
+            p path~dirent64~reclen
+            -
+            to n
+
+            p path~dirent64~next
+            to p
+
+            ~[
+        ]
+
+        failed to result
+    ]
+
+    [ :consume ( u32:failed -- u32:result )
+        [
+            scan-fd
+            dir-buffer
+            dir-buffer~len
+            linux~getdents64
+
+            ^ 0 < ? error
+
+            [
+                ^ 0 = ? ~]
+            ]
+
+            dp
+            dir-buffer
+            failed
+            walk
+            to failed
+
+            ~[
+        ]
+
+        _
+
+        failed to result
+    ]
+
+    0
+    consume
+    to status
+
+    scan-fd
+    linux~close
+    0 < ? error
+]
+
+[ :run-path ( cstr:p -- u32:status )
+    [ :error 13 panic ]
+
+    [ :as-file ( :probe -- u32:v )
+        p
+        run-file
+        to v
+    ]
+
+    [ :as-dir ( :fd -- u32:v )
+        p
+        fd
+        run-dir
+        to v
+    ]
+
+    p
+    -100
+    path~open-dir-at
+
+    [
+        ^ -20 = ? as-file  # ENOTDIR
+        ^ 0 < ? error      # e.g. -2 ENOENT
+        as-dir
+    ]
+
+    to status
+]
+
+[ :start
+    [ argc 1 = ? ~] ]
+
+    [ :usage
+        "Usage: hitherto test <path>" str~.\n
+        2 linux~exit
+    ]
+    [ :failed
+        1 linux~exit
+    ]
+
+    [ :finish ( u32:status -- )
+        status 0 =
+        [
+            0 = ? ~]
+        ]
+        1 linux~exit
+    ]
+
+    [ :run-directory ( cstr:fp -- )
+        fp run-dir
+        finish
+        0 linux~exit
+    ]
+
+    [ :run-single ( cstr:fp -- )
+        fp run-file
+        finish
+        0 linux~exit
+    ]
+
+    [ :test-proc
+        2 arg
+        -100
+        path~open
+
+        "Running " str~.
+        2 arg cstr~.\n
+
+        core~source-dirfd !
+        core~source-fd !
+
+        0 core~source-data !
+        0 core~source-len !
+    ]
+
+    argc 3 = 0 = ? usage
+
+    [
+        1 arg
+        c"test-proc"
+        cstr~eq
+        ? test-proc
+
+        1 arg
+        c"test"
+        cstr~eq
+        0 = ? usage
+
+        2 arg
+        run-path
+        0 = 0 = ? failed
+
+        0 linux~exit
+    ]
+]

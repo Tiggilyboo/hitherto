@@ -1,0 +1,10 @@
+[ module:test import "../src/test.ht" ]
+
+[ :increment ( :x -- x )
+    x 1 + to x
+]
+
+test~bench
+41 increment
+42
+test~assert
