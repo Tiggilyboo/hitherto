@@ -1,4 +1,3 @@
-
 [ linux:linux
     [ :clock-gettime ( :clock-id addr:tp -- :result )
         228
@@ -51,29 +50,40 @@
     init
 ]
 
-[ :pass
+# abort the test: the runner reports the failure
+[ :fail ( -- )
+    -1 linux~exit
+]
+
+# a passing assert falls through, so a test can assert as often as it likes;
+# the runner derives the verdict from the exit status
+[ :assert ( addr:actual addr:expected -- )
+    [ :mismatch
+        actual .
+        " != " str~.
+        expected .
+        ascii~.\n
+        fail
+    ]
+
+    [
+        actual expected = 0 = ? mismatch
+    ]
+]
+
+# timing belongs to a benchmark, not to every test: bench/finish print the
+# elapsed time themselves
+[ :bench
+    clock~now
+    timestamp u64~!
+]
+
+[ :finish
     clock~now
     timestamp u64~@
     -
     .
     " ns" str~.\n
 
-    "PASS" str~.\n
     0 linux~exit
-]
-
-[ :fail ( str:reason -- )
-    "FAIL" str~.\n
-    -1 linux~exit
-]
-
-[ :assert ( addr:actual addr:expected -- )
-    actual expected =
-    ? pass
-    fail
-]
-
-[ :bench
-    clock~now
-    timestamp u64~!
 ]

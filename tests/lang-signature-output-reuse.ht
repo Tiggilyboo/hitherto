@@ -4,7 +4,6 @@
     x 1 + to x
 ]
 
-test~bench
 41 increment
 42
 test~assert

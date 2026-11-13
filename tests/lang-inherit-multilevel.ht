@@ -22,7 +22,6 @@
     ]
 ]
 
-test~bench
 leaf~twice
 42
 test~assert

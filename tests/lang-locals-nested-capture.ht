@@ -8,7 +8,6 @@
     10 inner to r
 ]
 
-test~bench
 32 outer-capture
 42
 test~assert

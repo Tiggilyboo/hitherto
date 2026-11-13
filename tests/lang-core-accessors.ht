@@ -1,0 +1,37 @@
+[ module:test import "../src/test.ht" ]
+
+# the state slot reports the compiler state, and a running test is EXEC
+core~state @
+core~state-exe
+test~assert
+
+# the baked state values are distinct
+core~state-exe core~state-def =
+0
+test~assert
+
+# core-base is the address of slot $0
+core~core-base @
+core~panic-handler
+test~assert
+
+# scope-cursor@ reports the live scope cursor: above the scope stack base (the
+# running test has a frame), below the data stack, which is the scope stack end
+core~scope-stack @ core~scope-cursor@ ~_ <
+1
+test~assert
+
+core~scope-cursor@ ~_ core~data-stack @ <
+1
+test~assert
+
+# reads are stable
+core~scope-cursor@ ~_
+core~scope-cursor@ ~_
+test~assert
+
+# a read lands above the value already there: 7 survives the trampoline
+7
+core~scope-cursor@ ~_ core~scope-cursor@ ~_ - _
+7
+test~assert

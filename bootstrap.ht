@@ -87,6 +87,10 @@
     ]
     to c
 ]
+[ :> ( :a :b -- :c )
+    b a <
+    to c
+]
 [ :/% ( :a :b -- :q :r )
     [ :zero 11 panic ]
     b 0 = ? zero
@@ -189,6 +193,15 @@
 
     [ :scope-stack $21 lit immediate ]
     [ :data-stack $22 lit immediate ]
+
+    [ :state $23 lit immediate ]
+    [ :core-base $24 lit immediate ]
+
+    [ :scope-cursor@ $25 lit immediate ]
+
+    # the state slot values, baked so .ht does not hardcode them
+    [ :state-exe 0 lit immediate ]
+    [ :state-def 1 lit immediate ]
 ]
 
 # qword allocation in the data stack
@@ -1473,7 +1486,7 @@
 ]
 
 ' debugger core~panic-handler !
-"Loaded debugger" str~.\n
+"dbg: OK" str~.\n
 
 [ :path
     [ :open ( cstr:q :base-dirfd -- :result-fd :result-dirfd )
@@ -1637,8 +1650,13 @@
     ]
 ]
 
-"Booted" str~.\n
-
 [ module:cli import "src/cli.ht" ]
+
+# something to try out - lit immediate short form
+[ :const ( :a -- )
+    a
+    lit
+    immediate
+]
 
 cli~start

@@ -1,0 +1,14 @@
+[ :read
+  # need to have access to the parser
+  # not implemented yet
+]
+[ :eval ]
+[ :print ]
+  
+[
+  read
+  eval
+  print
+  ~[
+]
+

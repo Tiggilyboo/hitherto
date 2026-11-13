@@ -1,6 +1,5 @@
 [ module:test import "../src/test.ht" ]
 
-test~bench
 0x0f 0xf0 |
 0xff
 test~assert

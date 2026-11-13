@@ -53,7 +53,7 @@
 [ :run-file ( cstr:fp -- u32:status )
     [ :error 13 panic ]
 
-    [ :test-exec-argv
+    [ :file-exec-argv
         [ :init
             32 arena~alloc
             lit
@@ -74,13 +74,13 @@
     [ :child ( :pid -- )
         pid 0 = 0 = ? error
 
-        c"/proc/self/exe" test-exec-argv !
-        c"test-proc" test-exec-argv 8 + !
-        fp test-exec-argv 16 + !
-        0 test-exec-argv 24 + !
+        c"/proc/self/exe" file-exec-argv !
+        c"proc" file-exec-argv 8 + !
+        fp file-exec-argv 16 + !
+        0 file-exec-argv 24 + !
 
         c"/proc/self/exe"
-        test-exec-argv
+        file-exec-argv
         0
         linux~execve
 
@@ -107,6 +107,16 @@
         to pstatus
     ]
 
+    # the file prints only its failure detail: the runner reads the child's
+    # exit status and owns the PASS/FAIL verdict
+    [ :passed
+        "PASS" str~.\n
+    ]
+
+    [ :failed
+        "FAIL" str~.\n
+    ]
+
     linux~fork
 
     [
@@ -116,6 +126,11 @@
 
     parent
     to status
+
+    [
+        status 0 = ? passed
+        failed
+    ]
 ]
 
 [ :run-dir ( cstr:dp :scan-fd -- u32:status )
@@ -247,10 +262,11 @@
 ]
 
 [ :start
-    [ argc 1 = ? ~] ]
-
     [ :usage
-        "Usage: hitherto test <path>" str~.\n
+        "Usage: " str~.\n
+        "    hitherto run <path>" str~.\n
+        "    hitherto repl" str~.\n
+            
         2 linux~exit
     ]
     [ :failed
@@ -277,7 +293,7 @@
         0 linux~exit
     ]
 
-    [ :test-proc
+    [ :file-proc
         2 arg
         -100
         path~open
@@ -292,23 +308,27 @@
         0 core~source-len !
     ]
 
-    argc 3 = 0 = ? usage
-
-    [
-        1 arg
-        c"test-proc"
-        cstr~eq
-        ? test-proc
-
-        1 arg
-        c"test"
-        cstr~eq
-        0 = ? usage
-
+    [ :arg-run
+        argc 3 < ? usage
         2 arg
         run-path
         0 = 0 = ? failed
 
         0 linux~exit
     ]
+
+    [ :arg-repl
+        [ :repl import "repl.ht" ]
+    ]
+
+    [
+        argc 2 < ? usage
+
+        1 arg
+        ^ c"run" cstr~eq ? arg-run
+        ^ c"repl" cstr~eq ? arg-repl
+        ^ c"proc" cstr~eq ? file-proc
+        usage
+    ]
 ]
+

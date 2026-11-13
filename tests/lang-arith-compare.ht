@@ -1,6 +1,5 @@
 [ module:test import "../src/test.ht" ]
 
-test~bench
 -1 0 <
 1
 test~assert

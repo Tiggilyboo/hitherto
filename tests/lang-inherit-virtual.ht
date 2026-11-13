@@ -16,7 +16,6 @@
     ]
 ]
 
-test~bench
 derived~twice
 42
 test~assert

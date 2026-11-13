@@ -15,7 +15,6 @@
     r 1 + to r
 ]
 
-test~bench
 1 branch-region
 42
 test~assert

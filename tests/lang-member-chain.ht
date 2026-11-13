@@ -8,7 +8,6 @@
     ]
 ]
 
-test~bench
 root~branch~value
 42
 test~assert

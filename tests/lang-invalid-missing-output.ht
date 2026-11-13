@@ -1,15 +1,18 @@
 [ module:test import "../src/test.ht" ]
 
 [ :expect-not-found ( frame:f -- )
-    [ :ok
-        "PASS" str~.\n
-        0 linux~exit
-    ]
+    # success is silence: the runner's exit status is the verdict
+    [ :ok 0 linux~exit ]
 
     f frame~code
     2 =
     ? ok
 
+    "expected Key in dictionary not found (2), got " str~.
+    f frame~code-desc str~.
+    " (" str~.
+    f frame~code .
+    ")" str~.\n
     -1 linux~exit
 ]
 

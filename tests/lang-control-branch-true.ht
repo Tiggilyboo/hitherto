@@ -9,7 +9,6 @@
     7 to r
 ]
 
-test~bench
 1 choose
 42
 test~assert

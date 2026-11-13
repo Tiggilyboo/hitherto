@@ -13,7 +13,6 @@
     ]
 ]
 
-test~bench
 break-at-five
 5
 test~assert

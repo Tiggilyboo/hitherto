@@ -8,7 +8,6 @@
 
 [ base:derived ]
 
-test~bench
 derived~value
 42
 test~assert

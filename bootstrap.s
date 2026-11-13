@@ -10,7 +10,6 @@
 .equ DATA_STACK_SIZE, 65536
 .equ DICT_SIZE, 131072
 .equ DICT_QWORDS, DICT_SIZE / 8
-
 .equ CORE_QWORDS, (core_end - core) / 8
 
 .equ STATE_EXE, 0
@@ -127,14 +126,21 @@ scope_stack_ptr:
 data_stack_ptr:
     .quad data_stack
 
+state:
+    .quad STATE_EXE
+core_base:
+    .quad core
+
+# dedicated register accessor, invoked from Stage1 via ~_
+scope_cursor_ptr:
+    .quad word_scope_cursor_get
+
 core_end:
 
 .section .bss
 
 # private state not exposed to core
 .align 8
-state:
-    .quad 0
 panic_active:
     .quad 0
 token_buf:
@@ -1437,6 +1443,19 @@ word_dict_tail_set:
     mov r14, r13
     sub r15, 8
     mov r13, [r15]
+    ret
+
+# Dedicated register accessor, invoked from Stage1 via ~_. Same TOS convention
+# as word_dict_tail_get: pushes the old TOS and exposes the register value.
+# Read-only: a ~_ invoked stub runs in ~_'s own frame (word_exec has already set
+# rbp/r12, and restores rbx when ~_ returns), so stubs can only expose what a
+# nested frame leaves authoritative - rbx, the live scope cursor. rbp/r12 are
+# reachable through the scope stack instead. Other targets reimplement this
+# stub per-target.
+word_scope_cursor_get:
+    mov [r15], r13
+    add r15, 8
+    mov r13, rbx
     ret
 
 word_lit:

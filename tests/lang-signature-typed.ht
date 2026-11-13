@@ -4,7 +4,6 @@
     x 1 + to r
 ]
 
-test~bench
 41 typed-increment
 42
 test~assert
